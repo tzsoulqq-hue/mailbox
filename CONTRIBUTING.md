@@ -8,7 +8,7 @@
 
 1. 修改契约时先改 `proto/`。
 2. Go gRPC 代码通过 `providers/outlook/imap-service/Dockerfile` 或 `scripts/generate-proto.sh` 生成。
-3. Python gRPC 代码通过 `providers/outlook/register-service/Dockerfile` 生成。
+3. Python gRPC 代码通过 `providers/outlook/register-service/Dockerfile` 或 `scripts/generate-proto.sh` 生成。
 4. 运行产物和敏感材料放在忽略路径。
 
 ## 验证

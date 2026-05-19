@@ -86,6 +86,51 @@ func newGRPCClient(name string, addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 }
 
+func (s *server) ListMailboxes(ctx context.Context, req *pb.ListEmailMailboxesRequest) (*pb.ListEmailMailboxesResponse, error) {
+	resp, err := s.emailClient.ListMailboxes(ctx, req)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "list mailboxes: %v", err)
+	}
+	if resp == nil {
+		return nil, status.Error(codes.Internal, "email service returned empty mailbox list")
+	}
+	return resp, nil
+}
+
+func (s *server) UpsertMailbox(ctx context.Context, req *pb.UpsertEmailMailboxRequest) (*pb.UpsertEmailMailboxResponse, error) {
+	mailbox := req.GetMailbox()
+	if mailbox == nil || normalizeEmail(mailbox.GetEmailAddress()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "mailbox email_address is required")
+	}
+	mailbox.EmailAddress = normalizeEmail(mailbox.GetEmailAddress())
+	if mailbox.GetPrimaryEmail() == "" {
+		mailbox.PrimaryEmail = mailbox.GetEmailAddress()
+	}
+	resp, err := s.emailClient.UpsertMailbox(ctx, req)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "upsert mailbox: %v", err)
+	}
+	if resp == nil || resp.GetMailbox() == nil {
+		return nil, status.Error(codes.Internal, "email service returned empty mailbox")
+	}
+	return resp, nil
+}
+
+func (s *server) DeleteMailbox(ctx context.Context, req *pb.DeleteMailboxRequest) (*pb.DeleteMailboxResponse, error) {
+	email := normalizeEmail(req.GetEmailAddress())
+	if email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email_address is required")
+	}
+	resp, err := s.emailClient.DeleteMailbox(ctx, &pb.DeleteMailboxRequest{EmailAddress: email})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "delete mailbox: %v", err)
+	}
+	if resp == nil {
+		return nil, status.Error(codes.Internal, "email service returned empty delete response")
+	}
+	return resp, nil
+}
+
 func (s *server) RegisterMailbox(ctx context.Context, req *pb.RegisterMailboxRequest) (*pb.RegisterMailboxResponse, error) {
 	operationID := operationID("mailbox-register")
 	resp, err := s.mailboxRegisterClient.RunMailboxRegistration(ctx, &pb.RunMailboxRegistrationRequest{

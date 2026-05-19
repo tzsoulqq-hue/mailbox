@@ -178,12 +178,10 @@ def build_register_config(proxy: str | None = None) -> dict:
     enable_oauth2 = env_bool("OUTLOOK_REGISTER_ENABLE_OAUTH2", True)
     client_id = (
         env_str("OUTLOOK_REGISTER_OAUTH_CLIENT_ID")
-        or env_str("OUTLOOK_OAUTH_CLIENT_ID")
         or DEFAULT_OAUTH_CLIENT_ID
     )
     redirect_url = (
         env_str("OUTLOOK_REGISTER_OAUTH_REDIRECT_URL")
-        or env_str("OUTLOOK_OAUTH_REDIRECT_URL")
         or DEFAULT_OAUTH_REDIRECT_URL
     )
     if enable_oauth2 and (not client_id or not redirect_url):
@@ -597,12 +595,10 @@ def run_oauth(
 
     client_id = (
         env_str("OUTLOOK_REGISTER_OAUTH_CLIENT_ID")
-        or env_str("OUTLOOK_OAUTH_CLIENT_ID")
         or DEFAULT_OAUTH_CLIENT_ID
     )
     redirect_url = (
         env_str("OUTLOOK_REGISTER_OAUTH_REDIRECT_URL")
-        or env_str("OUTLOOK_OAUTH_REDIRECT_URL")
         or DEFAULT_OAUTH_REDIRECT_URL
     )
     scopes = split_scopes(env_str("OUTLOOK_REGISTER_OAUTH_SCOPES", DEFAULT_SCOPES))

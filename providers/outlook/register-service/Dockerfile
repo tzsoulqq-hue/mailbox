@@ -2,9 +2,8 @@ FROM nb-register-camoufox-base:latest
 
 WORKDIR /app
 
-COPY proto/email.proto /app/proto/email.proto
 COPY proto/mailbox_register.proto /app/proto/mailbox_register.proto
-RUN python -m grpc_tools.protoc -I /app/proto --python_out=/app --grpc_python_out=/app /app/proto/email.proto /app/proto/mailbox_register.proto
+RUN python -m grpc_tools.protoc -I /app/proto --python_out=/app --grpc_python_out=/app /app/proto/mailbox_register.proto
 
 COPY providers/outlook/register-service/register_provider.py /app/register_provider.py
 COPY providers/outlook/register-service/register_service.py /app/register_service.py

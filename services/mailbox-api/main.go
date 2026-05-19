@@ -65,6 +65,7 @@ func main() {
 
 	activities := &mailboxActivities{
 		mailboxRegisterClient: pb.NewMailboxRegistrationServiceClient(registerConn),
+		emailClient:           pb.NewEmailServiceClient(emailConn),
 		operations:            operations,
 	}
 	worker, err := workflowruntime.NewWorker(temporalClient, mailboxWorkerSpec(cfg.temporal.TaskQueue, activities))

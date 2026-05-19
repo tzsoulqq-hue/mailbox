@@ -16,10 +16,14 @@ const (
 	activityErrorMailboxRegistrationEmpty       = "MAILBOX_REGISTRATION_EMPTY"
 	activityErrorMailboxOAuthUnavailable        = "MAILBOX_OAUTH_UNAVAILABLE"
 	activityErrorMailboxOAuthEmpty              = "MAILBOX_OAUTH_EMPTY"
+	emailAuthAuthorized                         = "AUTHORIZED"
+	emailAuthFailed                             = "AUTH_FAILED"
+	emailAuthNeedsManualVerification            = "NEEDS_MANUAL_VERIFICATION"
 )
 
 type mailboxActivities struct {
 	mailboxRegisterClient pb.MailboxRegistrationServiceClient
+	emailClient           pb.EmailServiceClient
 	operations            *operationStore
 }
 
@@ -59,6 +63,12 @@ func (a *mailboxActivities) RunMailboxRegistration(ctx context.Context, input re
 		ErrorMessage: strings.TrimSpace(resp.GetErrorMessage()),
 		MailboxCount: registeredMailboxCount(resp.GetAccounts()),
 	}
+	if result.Success {
+		if err := a.persistRegisteredAccounts(ctx, resp.GetAccounts()); err != nil {
+			result.Success = false
+			result.ErrorMessage = fmt.Sprintf("persist registered mailboxes: %v", err)
+		}
+	}
 	if !result.Success && result.ErrorMessage == "" {
 		result.ErrorMessage = "mailbox registration failed"
 	}
@@ -72,10 +82,22 @@ func (a *mailboxActivities) RunMailboxOAuth(ctx context.Context, input mailboxOA
 		return mailboxOperationResult{OperationID: operationID, ErrorMessage: err.Error()}, err
 	}
 
+	accounts, err := a.oauthAccounts(ctx, input.EmailAddress, input.OnlyMissing, normalizedLimit(input.Limit))
+	if err != nil {
+		message := fmt.Sprintf("select mailbox OAuth accounts: %v", err)
+		a.updateOperation(ctx, operationID, operationUpdate{
+			Status:       operationStatusFailed,
+			LastStep:     "run_oauth",
+			ErrorMessage: message,
+		})
+		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, nil
+	}
+
 	resp, err := a.mailboxRegisterClient.RunMailboxOAuth(ctx, &pb.RunMailboxOAuthRequest{
 		EmailAddress: normalizeEmail(input.EmailAddress),
 		OnlyMissing:  input.OnlyMissing,
 		Limit:        normalizedLimit(input.Limit),
+		Accounts:     accounts,
 	})
 	if err != nil {
 		message := fmt.Sprintf("run mailbox OAuth: %v", err)
@@ -103,6 +125,10 @@ func (a *mailboxActivities) RunMailboxOAuth(ctx context.Context, input mailboxOA
 		MailboxCount: resp.GetProcessed(),
 		FetchedCount: resp.GetSucceeded(),
 		FailedCount:  resp.GetFailed(),
+	}
+	if err := a.persistOAuthResults(ctx, resp.GetResults(), accounts); err != nil {
+		result.Success = false
+		result.ErrorMessage = fmt.Sprintf("persist mailbox OAuth results: %v", err)
 	}
 	if !result.Success && result.ErrorMessage == "" {
 		result.ErrorMessage = "mailbox OAuth failed"
@@ -150,4 +176,163 @@ func registeredMailboxCount(accounts []*pb.MailboxRegistrationAccount) int32 {
 		}
 	}
 	return count
+}
+
+func (a *mailboxActivities) persistRegisteredAccounts(ctx context.Context, accounts []*pb.MailboxRegistrationAccount) error {
+	for _, account := range accounts {
+		email := normalizeEmail(account.GetEmailAddress())
+		password := strings.TrimSpace(account.GetPassword())
+		if email == "" {
+			continue
+		}
+		if password == "" {
+			return fmt.Errorf("mailbox account missing password: %s", email)
+		}
+		if err := a.upsertMailbox(ctx, &pb.EmailMailbox{
+			EmailAddress: email,
+			Password:     password,
+			RefreshToken: strings.TrimSpace(account.GetRefreshToken()),
+			AccessToken:  strings.TrimSpace(account.GetAccessToken()),
+			AuthStatus:   mailboxAuthStatus(account.GetRefreshToken(), ""),
+			LastError:    "",
+			IsPrimary:    true,
+			PrimaryEmail: email,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *mailboxActivities) oauthAccounts(ctx context.Context, emailAddress string, onlyMissing bool, limit int32) ([]*pb.MailboxRegistrationAccount, error) {
+	requestedEmail := normalizeEmail(emailAddress)
+	selectedLimit := limit
+	if requestedEmail != "" {
+		selectedLimit = 500
+	}
+	resp, err := a.emailClient.ListMailboxes(ctx, &pb.ListEmailMailboxesRequest{Limit: selectedLimit})
+	if err != nil {
+		return nil, fmt.Errorf("list mailboxes: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("email service returned empty mailbox list")
+	}
+	accounts := make([]*pb.MailboxRegistrationAccount, 0, len(resp.GetMailboxes()))
+	for _, mailbox := range resp.GetMailboxes() {
+		email := normalizeEmail(mailbox.GetEmailAddress())
+		if email == "" {
+			continue
+		}
+		if requestedEmail != "" && email != requestedEmail {
+			continue
+		}
+		if !mailbox.GetIsPrimary() {
+			continue
+		}
+		if strings.TrimSpace(mailbox.GetPassword()) == "" {
+			continue
+		}
+		authStatus := mailboxAuthStatus(mailbox.GetRefreshToken(), mailbox.GetAuthStatus())
+		if onlyMissing && (authStatus == emailAuthAuthorized || authStatus == emailAuthNeedsManualVerification) {
+			continue
+		}
+		accounts = append(accounts, &pb.MailboxRegistrationAccount{
+			EmailAddress: email,
+			Password:     strings.TrimSpace(mailbox.GetPassword()),
+			RefreshToken: strings.TrimSpace(mailbox.GetRefreshToken()),
+			AccessToken:  strings.TrimSpace(mailbox.GetAccessToken()),
+			Source:       "mailboxes",
+		})
+		if requestedEmail == "" && int32(len(accounts)) >= selectedLimit {
+			break
+		}
+	}
+	if requestedEmail != "" && len(accounts) == 0 {
+		return nil, fmt.Errorf("mailbox not found or not eligible for OAuth: %s", requestedEmail)
+	}
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("no mailbox accounts eligible for OAuth")
+	}
+	return accounts, nil
+}
+
+func (a *mailboxActivities) persistOAuthResults(ctx context.Context, results []*pb.MailboxOAuthResult, accounts []*pb.MailboxRegistrationAccount) error {
+	passwordByEmail := make(map[string]string, len(accounts))
+	for _, account := range accounts {
+		if email := normalizeEmail(account.GetEmailAddress()); email != "" {
+			passwordByEmail[email] = strings.TrimSpace(account.GetPassword())
+		}
+	}
+	for _, result := range results {
+		email := normalizeEmail(result.GetEmailAddress())
+		if email == "" {
+			continue
+		}
+		refreshToken := strings.TrimSpace(result.GetRefreshToken())
+		if result.GetSuccess() && refreshToken != "" {
+			if err := a.upsertMailbox(ctx, &pb.EmailMailbox{
+				EmailAddress: email,
+				Password:     passwordByEmail[email],
+				RefreshToken: refreshToken,
+				AccessToken:  strings.TrimSpace(result.GetAccessToken()),
+				AuthStatus:   emailAuthAuthorized,
+				LastError:    "",
+				IsPrimary:    true,
+				PrimaryEmail: email,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if !result.GetSuccess() {
+			if err := a.markEmailAuthStatus(ctx, email, mailboxOAuthFailureStatus(result.GetErrorMessage()), result.GetErrorMessage()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (a *mailboxActivities) upsertMailbox(ctx context.Context, mailbox *pb.EmailMailbox) error {
+	resp, err := a.emailClient.UpsertMailbox(ctx, &pb.UpsertEmailMailboxRequest{Mailbox: mailbox})
+	if err != nil {
+		return fmt.Errorf("upsert mailbox %s: %w", normalizeEmail(mailbox.GetEmailAddress()), err)
+	}
+	if resp == nil || resp.GetMailbox() == nil {
+		return fmt.Errorf("email service returned empty mailbox for %s", normalizeEmail(mailbox.GetEmailAddress()))
+	}
+	return nil
+}
+
+func (a *mailboxActivities) markEmailAuthStatus(ctx context.Context, email string, authStatus string, lastError string) error {
+	resp, err := a.emailClient.MarkEmailAuthStatus(ctx, &pb.MarkEmailAuthStatusRequest{
+		EmailAddress: normalizeEmail(email),
+		AuthStatus:   authStatus,
+		LastError:    strings.TrimSpace(lastError),
+	})
+	if err != nil {
+		return fmt.Errorf("mark mailbox auth status %s: %w", normalizeEmail(email), err)
+	}
+	if resp == nil || resp.GetMailbox() == nil {
+		return fmt.Errorf("email service returned empty auth status response for %s", normalizeEmail(email))
+	}
+	return nil
+}
+
+func mailboxAuthStatus(refreshToken string, explicitStatus string) string {
+	if status := strings.TrimSpace(explicitStatus); status != "" {
+		return status
+	}
+	if strings.TrimSpace(refreshToken) != "" {
+		return emailAuthAuthorized
+	}
+	return "OAUTH_PENDING"
+}
+
+func mailboxOAuthFailureStatus(errorMessage string) string {
+	errorText := strings.ToLower(strings.TrimSpace(errorMessage))
+	if strings.Contains(errorText, "needs_manual_verification") || strings.Contains(errorText, "account.live.com/abuse") {
+		return emailAuthNeedsManualVerification
+	}
+	return emailAuthFailed
 }

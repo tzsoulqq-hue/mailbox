@@ -7,7 +7,7 @@ Mailbox 领域仓。
 ## 目录
 
 - `providers/outlook/imap-service`：Outlook Graph 邮件读取、邮箱账号存储、OTP 提取和 gRPC 服务。
-- `providers/outlook/register-service`：Outlook 邮箱注册、OAuth 获取、邮箱存储同步和 gRPC 服务。
+- `providers/outlook/register-service`：Outlook 邮箱注册、OAuth 获取和 gRPC 服务。
 - `services/mailbox-api`：Mailbox 领域 gRPC API，聚合邮箱注册、OAuth 和收件能力。
 - `proto/email.proto`：邮件读取服务契约。
 - `proto/mailbox_register.proto`：邮箱注册服务契约。
@@ -24,9 +24,7 @@ sh scripts/generate-proto.sh
 
 ## 配置
 
-`providers/outlook/register-service` 通过 `MAILBOX_EMAIL_SERVICE_ADDR` 连接邮箱存储服务。
-
-`OUTLOOK_REGISTER_ENABLE_OAUTH2` 控制注册流程是否同步获取 Outlook OAuth token；注册服务负责把账号和 OAuth 状态写入邮箱存储服务。
+`OUTLOOK_REGISTER_ENABLE_OAUTH2` 控制注册流程是否同步获取 Outlook OAuth token；注册服务返回账号和 OAuth 结果，邮箱存储写入由 `services/mailbox-api` workflow activity 执行。
 
 `services/mailbox-api` 通过 `MAILBOX_EMAIL_SERVICE_ADDR` 连接邮箱存储服务，通过 `MAILBOX_REGISTER_ADDR` 连接 Outlook 注册/OAuth 服务，并通过 `MAILBOX_API_PG_DSN` 维护邮箱操作状态投影。注册和 OAuth 流程由 mailbox-api 内置 Temporal worker 执行，使用 `TEMPORAL_ADDRESS`、`TEMPORAL_NAMESPACE`、`TEMPORAL_TASK_QUEUE` 和 `TEMPORAL_IDENTITY` 连接运行时。
 

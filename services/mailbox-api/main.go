@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	workflowruntime "github.com/byte-v-forge/workflow-runtime"
+	"go.temporal.io/sdk/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -24,14 +26,16 @@ type config struct {
 	pgDSN               string
 	emailAddr           string
 	mailboxRegisterAddr string
+	temporal            workflowruntime.Config
 }
 
 type server struct {
 	pb.UnimplementedMailboxServiceServer
 
-	emailClient           pb.EmailServiceClient
-	mailboxRegisterClient pb.MailboxRegistrationServiceClient
-	operations            *operationStore
+	emailClient       pb.EmailServiceClient
+	operations        *operationStore
+	workflowClient    client.Client
+	workflowTaskQueue string
 }
 
 func main() {
@@ -53,6 +57,25 @@ func main() {
 		log.Fatalf("failed to initialize mailbox operation store: %v", err)
 	}
 
+	temporalClient, err := workflowruntime.Dial(cfg.temporal)
+	if err != nil {
+		log.Fatalf("failed to connect Temporal: %v", err)
+	}
+	defer temporalClient.Close()
+
+	activities := &mailboxActivities{
+		mailboxRegisterClient: pb.NewMailboxRegistrationServiceClient(registerConn),
+		operations:            operations,
+	}
+	worker, err := workflowruntime.NewWorker(temporalClient, mailboxWorkerSpec(cfg.temporal.TaskQueue, activities))
+	if err != nil {
+		log.Fatalf("failed to create mailbox Temporal worker: %v", err)
+	}
+	if err := worker.Start(); err != nil {
+		log.Fatalf("failed to start mailbox Temporal worker: %v", err)
+	}
+	defer worker.Stop()
+
 	listener, err := net.Listen("tcp", cfg.listenAddr)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", cfg.listenAddr, err)
@@ -60,9 +83,10 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterMailboxServiceServer(grpcServer, &server{
-		emailClient:           pb.NewEmailServiceClient(emailConn),
-		mailboxRegisterClient: pb.NewMailboxRegistrationServiceClient(registerConn),
-		operations:            operations,
+		emailClient:       pb.NewEmailServiceClient(emailConn),
+		operations:        operations,
+		workflowClient:    temporalClient,
+		workflowTaskQueue: cfg.temporal.TaskQueue,
 	})
 
 	log.Printf("mailbox API listening on %s", cfg.listenAddr)
@@ -72,11 +96,16 @@ func main() {
 }
 
 func loadConfig() config {
+	temporal, err := workflowruntime.LoadConfigFromEnv(os.Getenv)
+	if err != nil {
+		log.Fatalf("load Temporal config: %v", err)
+	}
 	return config{
 		listenAddr:          envDefault("LISTEN_ADDR", ":50051"),
 		pgDSN:               requiredEnvAny("MAILBOX_API_PG_DSN", "PG_DSN"),
 		emailAddr:           envDefault("EMAIL_ADDR", "outlook-imap-service:50051"),
 		mailboxRegisterAddr: envDefault("MAILBOX_REGISTER_ADDR", "outlook-register-service:50051"),
+		temporal:            temporal,
 	}
 }
 
@@ -155,69 +184,27 @@ func (s *server) RegisterMailbox(ctx context.Context, req *pb.RegisterMailboxReq
 	if _, err := s.operations.create(ctx, operationID, operationActionRegisterMailbox, ""); err != nil {
 		return nil, status.Errorf(codes.Internal, "create mailbox operation: %v", err)
 	}
-	if _, err := s.operations.update(ctx, operationID, operationUpdate{
-		Status:   operationStatusRunning,
-		LastStep: "run_registration",
-	}); err != nil {
-		return nil, status.Errorf(codes.Internal, "mark mailbox operation running: %v", err)
-	}
 
-	resp, err := s.mailboxRegisterClient.RunMailboxRegistration(ctx, &pb.RunMailboxRegistrationRequest{
-		Enabled:    !req.GetImportOnly(),
-		ImportOnly: req.GetImportOnly(),
-	})
-	if err != nil {
+	if err := s.startMailboxWorkflow(ctx, operationID, registerMailboxWorkflowName, registerMailboxWorkflowInput{
+		OperationID: operationID,
+		ImportOnly:  req.GetImportOnly(),
+	}); err != nil {
 		s.updateOperation(ctx, operationID, operationUpdate{
 			Status:       operationStatusFailed,
-			LastStep:     "run_registration",
+			LastStep:     "start_workflow",
 			ErrorMessage: err.Error(),
 		})
-		return nil, status.Errorf(codes.Unavailable, "run mailbox registration: %v", err)
-	}
-	if resp == nil {
-		s.updateOperation(ctx, operationID, operationUpdate{
-			Status:       operationStatusFailed,
-			LastStep:     "run_registration",
-			ErrorMessage: "mailbox registration service returned empty response",
-		})
-		return nil, status.Error(codes.Internal, "mailbox registration service returned empty response")
+		return &pb.RegisterMailboxResponse{
+			OperationId:  operationID,
+			Started:      false,
+			ErrorMessage: err.Error(),
+		}, nil
 	}
 
-	out := &pb.RegisterMailboxResponse{
-		OperationId:  operationID,
-		Success:      resp.GetSuccess(),
-		ExitCode:     resp.GetExitCode(),
-		ErrorMessage: resp.GetErrorMessage(),
-		Mailboxes:    make([]*pb.RegisteredMailbox, 0, len(resp.GetAccounts())),
-	}
-	for _, account := range resp.GetAccounts() {
-		email := normalizeEmail(account.GetEmailAddress())
-		if email == "" {
-			continue
-		}
-		out.Mailboxes = append(out.Mailboxes, &pb.RegisteredMailbox{
-			EmailAddress: email,
-			Password:     strings.TrimSpace(account.GetPassword()),
-			RefreshToken: strings.TrimSpace(account.GetRefreshToken()),
-			AccessToken:  strings.TrimSpace(account.GetAccessToken()),
-			Status:       mailboxStatus(account),
-		})
-	}
-	if !out.GetSuccess() && out.GetErrorMessage() == "" {
-		out.ErrorMessage = "mailbox registration failed"
-	}
-	statusValue := operationStatusSucceeded
-	if !out.GetSuccess() || strings.TrimSpace(out.GetErrorMessage()) != "" {
-		statusValue = operationStatusFailed
-	}
-	s.updateOperation(ctx, operationID, operationUpdate{
-		Status:       statusValue,
-		LastStep:     "run_registration",
-		ErrorMessage: out.GetErrorMessage(),
-		ExitCode:     out.GetExitCode(),
-		MailboxCount: int32(len(out.GetMailboxes())),
-	})
-	return out, nil
+	return &pb.RegisterMailboxResponse{
+		OperationId: operationID,
+		Started:     true,
+	}, nil
 }
 
 func (s *server) RunMailboxOAuth(ctx context.Context, req *pb.StartMailboxOAuthRequest) (*pb.StartMailboxOAuthResponse, error) {
@@ -226,51 +213,35 @@ func (s *server) RunMailboxOAuth(ctx context.Context, req *pb.StartMailboxOAuthR
 	if _, err := s.operations.create(ctx, operationID, operationActionMailboxOAuth, email); err != nil {
 		return nil, status.Errorf(codes.Internal, "create mailbox operation: %v", err)
 	}
-	if _, err := s.operations.update(ctx, operationID, operationUpdate{
-		Status:   operationStatusRunning,
-		LastStep: "run_oauth",
-	}); err != nil {
-		return nil, status.Errorf(codes.Internal, "mark mailbox operation running: %v", err)
-	}
 
-	resp, err := s.mailboxRegisterClient.RunMailboxOAuth(ctx, &pb.RunMailboxOAuthRequest{
+	if err := s.startMailboxWorkflow(ctx, operationID, mailboxOAuthWorkflowName, mailboxOAuthWorkflowInput{
+		OperationID:  operationID,
 		EmailAddress: email,
 		OnlyMissing:  req.GetOnlyMissing(),
 		Limit:        normalizedLimit(req.GetLimit()),
-	})
-	if err != nil {
+	}); err != nil {
 		s.updateOperation(ctx, operationID, operationUpdate{
 			Status:       operationStatusFailed,
-			LastStep:     "run_oauth",
+			LastStep:     "start_workflow",
 			ErrorMessage: err.Error(),
 		})
 		return &pb.StartMailboxOAuthResponse{OperationId: operationID, ErrorMessage: err.Error()}, nil
 	}
-	if resp == nil {
-		s.updateOperation(ctx, operationID, operationUpdate{
-			Status:       operationStatusFailed,
-			LastStep:     "run_oauth",
-			ErrorMessage: "mailbox registration service returned empty OAuth response",
-		})
-		return &pb.StartMailboxOAuthResponse{OperationId: operationID, ErrorMessage: "mailbox registration service returned empty OAuth response"}, nil
-	}
-	statusValue := operationStatusSucceeded
-	if !resp.GetSuccess() || strings.TrimSpace(resp.GetErrorMessage()) != "" {
-		statusValue = operationStatusFailed
-	}
-	s.updateOperation(ctx, operationID, operationUpdate{
-		Status:       statusValue,
-		LastStep:     "run_oauth",
-		ErrorMessage: resp.GetErrorMessage(),
-		MailboxCount: resp.GetProcessed(),
-		FetchedCount: resp.GetSucceeded(),
-		FailedCount:  resp.GetFailed(),
-	})
 	return &pb.StartMailboxOAuthResponse{
-		OperationId:  operationID,
-		Started:      resp.GetSuccess(),
-		ErrorMessage: resp.GetErrorMessage(),
+		OperationId: operationID,
+		Started:     true,
 	}, nil
+}
+
+func (s *server) startMailboxWorkflow(ctx context.Context, operationID string, workflowName string, input any) error {
+	if s.workflowClient == nil {
+		return fmt.Errorf("Temporal client is not initialized")
+	}
+	_, err := s.workflowClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        operationID,
+		TaskQueue: s.workflowTaskQueue,
+	}, workflowName, input)
+	return err
 }
 
 func (s *server) FetchMailboxInboxes(ctx context.Context, req *pb.FetchMailboxInboxesRequest) (*pb.FetchMailboxInboxesResponse, error) {
@@ -372,16 +343,6 @@ func normalizedLimit(limit int32) int32 {
 		return 500
 	}
 	return limit
-}
-
-func mailboxStatus(account *pb.MailboxRegistrationAccount) string {
-	if account == nil {
-		return "OAUTH_PENDING"
-	}
-	if strings.TrimSpace(account.GetRefreshToken()) != "" {
-		return "AUTHORIZED"
-	}
-	return "OAUTH_PENDING"
 }
 
 func operationID(prefix string) string {

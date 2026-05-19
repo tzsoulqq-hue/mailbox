@@ -21,20 +21,13 @@ message RegisterMailboxRequest {
   bool import_only = 1;
 }
 
-message RegisteredMailbox {
-  string email_address = 1;
-  string password = 2;
-  string refresh_token = 3;
-  string access_token = 4;
-  string status = 5;
-}
-
 message RegisterMailboxResponse {
+  reserved 4, 5;
+  reserved "exit_code", "mailboxes";
+
   string operation_id = 1;
-  bool success = 2;
-  int32 exit_code = 3;
-  string error_message = 4;
-  repeated RegisteredMailbox mailboxes = 5;
+  bool started = 2;
+  string error_message = 3;
 }
 
 message StartMailboxOAuthRequest {

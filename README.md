@@ -28,7 +28,7 @@ sh scripts/generate-proto.sh
 
 `OUTLOOK_REGISTER_ENABLE_OAUTH2` 控制注册流程是否同步获取 Outlook OAuth token；注册服务负责把账号和 OAuth 状态写入邮箱存储服务。
 
-`services/mailbox-api` 通过 `EMAIL_ADDR` 连接邮箱存储服务，通过 `MAILBOX_REGISTER_ADDR` 连接 Outlook 注册/OAuth 服务，并通过 `MAILBOX_API_PG_DSN` 维护邮箱操作状态投影。
+`services/mailbox-api` 通过 `EMAIL_ADDR` 连接邮箱存储服务，通过 `MAILBOX_REGISTER_ADDR` 连接 Outlook 注册/OAuth 服务，并通过 `MAILBOX_API_PG_DSN` 维护邮箱操作状态投影。注册和 OAuth 流程由 mailbox-api 内置 Temporal worker 执行，使用 `TEMPORAL_ADDRESS`、`TEMPORAL_NAMESPACE`、`TEMPORAL_TASK_QUEUE` 和 `TEMPORAL_IDENTITY` 连接运行时。
 
 ## 检查
 

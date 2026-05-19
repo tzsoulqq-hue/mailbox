@@ -28,7 +28,7 @@ type config struct {
 	emailAddr             string
 	browserAutomationAddr string
 	outlookRegistration   outlookRegistrationConfig
-	temporal              workflowruntime.Config
+	workflowRuntime       workflowruntime.Config
 }
 
 type server struct {
@@ -59,11 +59,11 @@ func main() {
 		log.Fatalf("failed to initialize mailbox operation store: %v", err)
 	}
 
-	temporalClient, err := workflowruntime.Dial(cfg.temporal)
+	workflowClient, err := workflowruntime.Dial(cfg.workflowRuntime)
 	if err != nil {
-		log.Fatalf("failed to connect Temporal: %v", err)
+		log.Fatalf("failed to connect workflow runtime: %v", err)
 	}
-	defer temporalClient.Close()
+	defer workflowClient.Close()
 
 	activities := &mailboxActivities{
 		outlookRegistration: newOutlookRegistrationRunner(
@@ -74,12 +74,12 @@ func main() {
 		emailClient: pb.NewEmailServiceClient(emailConn),
 		operations:  operations,
 	}
-	worker, err := workflowruntime.NewWorker(temporalClient, mailboxWorkerSpec(cfg.temporal.TaskQueue, activities))
+	worker, err := workflowruntime.NewWorker(workflowClient, mailboxWorkerSpec(cfg.workflowRuntime.TaskQueue, activities))
 	if err != nil {
-		log.Fatalf("failed to create mailbox Temporal worker: %v", err)
+		log.Fatalf("failed to create mailbox workflow worker: %v", err)
 	}
 	if err := worker.Start(); err != nil {
-		log.Fatalf("failed to start mailbox Temporal worker: %v", err)
+		log.Fatalf("failed to start mailbox workflow worker: %v", err)
 	}
 	defer worker.Stop()
 
@@ -92,8 +92,8 @@ func main() {
 	pb.RegisterMailboxServiceServer(grpcServer, &server{
 		emailClient:       pb.NewEmailServiceClient(emailConn),
 		operations:        operations,
-		workflowClient:    temporalClient,
-		workflowTaskQueue: cfg.temporal.TaskQueue,
+		workflowClient:    workflowClient,
+		workflowTaskQueue: cfg.workflowRuntime.TaskQueue,
 	})
 
 	log.Printf("mailbox API listening on %s", cfg.listenAddr)
@@ -103,17 +103,17 @@ func main() {
 }
 
 func loadConfig() config {
-	temporal, err := workflowruntime.LoadConfigFromEnv(os.Getenv)
+	workflowRuntime, err := workflowruntime.LoadConfigFromEnv(os.Getenv)
 	if err != nil {
-		log.Fatalf("load Temporal config: %v", err)
+		log.Fatalf("load workflow runtime config: %v", err)
 	}
 	return config{
 		listenAddr:            envDefault("LISTEN_ADDR", ":50051"),
-		pgDSN:                 requiredEnv("MAILBOX_API_PG_DSN"),
-		emailAddr:             requiredEnv("MAILBOX_EMAIL_SERVICE_ADDR"),
+		pgDSN:                 requiredEnv("MAILBOX_PG_DSN"),
+		emailAddr:             requiredEnv("MAILBOX_EMAIL_PROVIDER_ADDR"),
 		browserAutomationAddr: envDefault("BROWSER_AUTOMATION_ADDR", "browser-automation:50051"),
 		outlookRegistration:   loadOutlookRegistrationConfig(),
-		temporal:              temporal,
+		workflowRuntime:       workflowRuntime,
 	}
 }
 
@@ -261,7 +261,7 @@ func (s *server) RunMailboxOAuth(ctx context.Context, req *pb.StartMailboxOAuthR
 
 func (s *server) startMailboxWorkflow(ctx context.Context, operationID string, workflowName string, input any) error {
 	if s.workflowClient == nil {
-		return fmt.Errorf("Temporal client is not initialized")
+		return fmt.Errorf("workflow runtime client is not initialized")
 	}
 	_, err := s.workflowClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 		ID:        operationID,

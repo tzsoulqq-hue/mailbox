@@ -47,3 +47,29 @@ message RunMailboxOAuthResponse {
   string error_message = 5;
   repeated MailboxOAuthResult results = 6;
 }
+
+message SelectMailboxOAuthAccountsRequest {
+  string operation_id = 1;
+  string email_address = 2;
+  bool only_missing = 3;
+  int32 limit = 4;
+}
+
+message SelectMailboxOAuthAccountsResponse {
+  repeated MailboxRegistrationAccount accounts = 1;
+}
+
+message RunMailboxOAuthAccountRequest {
+  string operation_id = 1;
+  MailboxRegistrationAccount account = 2;
+}
+
+message RunMailboxOAuthAccountResponse {
+  MailboxOAuthResult result = 1;
+}
+
+message CompleteMailboxOAuthRequest {
+  string operation_id = 1;
+  repeated MailboxRegistrationAccount accounts = 2;
+  repeated MailboxOAuthResult results = 3;
+}

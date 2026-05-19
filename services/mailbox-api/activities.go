@@ -76,13 +76,13 @@ func (a *mailboxActivities) RunMailboxRegistration(ctx context.Context, input re
 	return result, nil
 }
 
-func (a *mailboxActivities) RunMailboxOAuth(ctx context.Context, input mailboxOAuthWorkflowInput) (mailboxOperationResult, error) {
-	operationID := strings.TrimSpace(input.OperationID)
+func (a *mailboxActivities) SelectMailboxOAuthAccounts(ctx context.Context, req *pb.SelectMailboxOAuthAccountsRequest) (*pb.SelectMailboxOAuthAccountsResponse, error) {
+	operationID := strings.TrimSpace(req.GetOperationId())
 	if err := a.markRunning(ctx, operationID, "run_oauth"); err != nil {
-		return mailboxOperationResult{OperationID: operationID, ErrorMessage: err.Error()}, err
+		return nil, err
 	}
 
-	accounts, err := a.oauthAccounts(ctx, input.EmailAddress, input.OnlyMissing, normalizedLimit(input.Limit))
+	accounts, err := a.oauthAccounts(ctx, req.GetEmailAddress(), req.GetOnlyMissing(), normalizedLimit(req.GetLimit()))
 	if err != nil {
 		message := fmt.Sprintf("select mailbox OAuth accounts: %v", err)
 		a.updateOperation(ctx, operationID, operationUpdate{
@@ -90,48 +90,82 @@ func (a *mailboxActivities) RunMailboxOAuth(ctx context.Context, input mailboxOA
 			LastStep:     "run_oauth",
 			ErrorMessage: message,
 		})
-		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, nil
+		return &pb.SelectMailboxOAuthAccountsResponse{}, nil
 	}
+	return &pb.SelectMailboxOAuthAccountsResponse{Accounts: accounts}, nil
+}
 
+func (a *mailboxActivities) RunMailboxOAuthAccount(ctx context.Context, req *pb.RunMailboxOAuthAccountRequest) (*pb.RunMailboxOAuthAccountResponse, error) {
+	account := req.GetAccount()
+	if account == nil || normalizeEmail(account.GetEmailAddress()) == "" {
+		return &pb.RunMailboxOAuthAccountResponse{Result: &pb.MailboxOAuthResult{
+			Success:      false,
+			ErrorMessage: "mailbox OAuth account is required",
+		}}, nil
+	}
 	resp, err := a.outlookRegistration.RunMailboxOAuth(ctx, &pb.RunMailboxOAuthRequest{
-		EmailAddress: normalizeEmail(input.EmailAddress),
-		OnlyMissing:  input.OnlyMissing,
-		Limit:        normalizedLimit(input.Limit),
-		Accounts:     accounts,
+		EmailAddress: normalizeEmail(account.GetEmailAddress()),
+		OnlyMissing:  false,
+		Limit:        1,
+		Accounts:     []*pb.MailboxRegistrationAccount{account},
 	})
 	if err != nil {
 		message := fmt.Sprintf("run mailbox OAuth: %v", err)
-		a.updateOperation(ctx, operationID, operationUpdate{
-			Status:       operationStatusFailed,
-			LastStep:     "run_oauth",
-			ErrorMessage: message,
-		})
-		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, workflowruntime.NewRetryableActivityError(activityErrorMailboxOAuthUnavailable, message, err)
+		return nil, workflowruntime.NewRetryableActivityError(activityErrorMailboxOAuthUnavailable, message, err)
 	}
 	if resp == nil {
 		message := "mailbox registration runner returned empty OAuth response"
-		a.updateOperation(ctx, operationID, operationUpdate{
-			Status:       operationStatusFailed,
-			LastStep:     "run_oauth",
-			ErrorMessage: message,
-		})
-		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, workflowruntime.NewNonRetryableActivityError(activityErrorMailboxOAuthEmpty, message, nil)
+		return nil, workflowruntime.NewNonRetryableActivityError(activityErrorMailboxOAuthEmpty, message, nil)
+	}
+	if len(resp.GetResults()) == 0 {
+		return &pb.RunMailboxOAuthAccountResponse{Result: &pb.MailboxOAuthResult{
+			EmailAddress: normalizeEmail(account.GetEmailAddress()),
+			Success:      false,
+			ErrorMessage: "mailbox OAuth returned no result",
+		}}, nil
+	}
+	return &pb.RunMailboxOAuthAccountResponse{Result: resp.GetResults()[0]}, nil
+}
+
+func (a *mailboxActivities) CompleteMailboxOAuth(ctx context.Context, req *pb.CompleteMailboxOAuthRequest) (mailboxOperationResult, error) {
+	operationID := strings.TrimSpace(req.GetOperationId())
+	results := req.GetResults()
+	response := &pb.RunMailboxOAuthResponse{Processed: int32(len(req.GetAccounts())), Results: results}
+	for _, result := range results {
+		if result.GetSuccess() {
+			response.Succeeded++
+		} else {
+			response.Failed++
+		}
+	}
+	response.Success = response.Processed > 0 && response.Failed == 0 && response.Succeeded > 0
+	if !response.Success {
+		response.ErrorMessage = fmt.Sprintf("mailbox OAuth failed: %d/%d", response.Failed, response.Processed)
 	}
 
 	result := mailboxOperationResult{
 		OperationID:  operationID,
-		Success:      resp.GetSuccess(),
-		ErrorMessage: strings.TrimSpace(resp.GetErrorMessage()),
-		MailboxCount: resp.GetProcessed(),
-		FetchedCount: resp.GetSucceeded(),
-		FailedCount:  resp.GetFailed(),
+		Success:      response.GetSuccess(),
+		ErrorMessage: strings.TrimSpace(response.GetErrorMessage()),
+		MailboxCount: response.GetProcessed(),
+		FetchedCount: response.GetSucceeded(),
+		FailedCount:  response.GetFailed(),
 	}
-	if err := a.persistOAuthResults(ctx, resp.GetResults(), accounts); err != nil {
+	if err := a.persistOAuthResults(ctx, response.GetResults(), req.GetAccounts()); err != nil {
 		result.Success = false
 		result.ErrorMessage = fmt.Sprintf("persist mailbox OAuth results: %v", err)
 	}
 	if !result.Success && result.ErrorMessage == "" {
 		result.ErrorMessage = "mailbox OAuth failed"
+	}
+	if len(req.GetAccounts()) == 0 {
+		result.ErrorMessage = "no mailbox accounts eligible for OAuth"
+		a.updateOperation(ctx, operationID, operationUpdate{
+			Status:       operationStatusFailed,
+			LastStep:     "run_oauth",
+			ErrorMessage: result.ErrorMessage,
+		})
+		return result, nil
 	}
 	a.finishOperation(ctx, operationID, "run_oauth", result)
 	return result, nil

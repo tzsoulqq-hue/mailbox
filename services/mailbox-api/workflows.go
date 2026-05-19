@@ -5,16 +5,22 @@ import (
 
 	workflowruntime "github.com/byte-v-forge/workflow-runtime"
 	"go.temporal.io/sdk/workflow"
+
+	"mailboxapi/pb"
 )
 
 const (
-	registerMailboxWorkflowName           = "mailbox.RegisterMailbox"
-	mailboxOAuthWorkflowName              = "mailbox.RunMailboxOAuth"
-	runMailboxRegistrationActivityName    = "mailbox.RunMailboxRegistration"
-	runMailboxOAuthActivityName           = "mailbox.RunMailboxOAuth"
-	mailboxRegistrationActivityTimeout    = 30 * time.Minute
-	mailboxOAuthActivityTimeout           = 30 * time.Minute
-	mailboxActivityScheduleTimeoutPadding = 5 * time.Minute
+	registerMailboxWorkflowName            = "mailbox.RegisterMailbox"
+	mailboxOAuthWorkflowName               = "mailbox.RunMailboxOAuth"
+	runMailboxRegistrationActivityName     = "mailbox.RunMailboxRegistration"
+	selectMailboxOAuthAccountsActivityName = "mailbox.SelectMailboxOAuthAccounts"
+	runMailboxOAuthAccountActivityName     = "mailbox.RunMailboxOAuthAccount"
+	completeMailboxOAuthActivityName       = "mailbox.CompleteMailboxOAuth"
+	mailboxRegistrationActivityTimeout     = 30 * time.Minute
+	mailboxOAuthSelectActivityTimeout      = 2 * time.Minute
+	mailboxOAuthAccountActivityTimeout     = 10 * time.Minute
+	mailboxOAuthCompleteActivityTimeout    = 2 * time.Minute
+	mailboxActivityScheduleTimeoutPadding  = 5 * time.Minute
 )
 
 type registerMailboxWorkflowInput struct {
@@ -49,7 +55,9 @@ func mailboxWorkerSpec(taskQueue string, activities *mailboxActivities) workflow
 		},
 		Activities: []workflowruntime.ActivityDefinition{
 			{Name: runMailboxRegistrationActivityName, Definition: activities.RunMailboxRegistration},
-			{Name: runMailboxOAuthActivityName, Definition: activities.RunMailboxOAuth},
+			{Name: selectMailboxOAuthAccountsActivityName, Definition: activities.SelectMailboxOAuthAccounts},
+			{Name: runMailboxOAuthAccountActivityName, Definition: activities.RunMailboxOAuthAccount},
+			{Name: completeMailboxOAuthActivityName, Definition: activities.CompleteMailboxOAuth},
 		},
 	}
 }
@@ -62,9 +70,46 @@ func RegisterMailboxWorkflow(ctx workflow.Context, input registerMailboxWorkflow
 }
 
 func RunMailboxOAuthWorkflow(ctx workflow.Context, input mailboxOAuthWorkflowInput) (mailboxOperationResult, error) {
-	ctx = workflowruntime.WithDefaultActivityOptions(ctx, mailboxActivityOptions(mailboxOAuthActivityTimeout))
+	selectCtx := workflowruntime.WithDefaultActivityOptions(ctx, mailboxActivityOptions(mailboxOAuthSelectActivityTimeout))
+	accountCtx := workflowruntime.WithDefaultActivityOptions(ctx, mailboxActivityOptions(mailboxOAuthAccountActivityTimeout))
+	completeCtx := workflowruntime.WithDefaultActivityOptions(ctx, mailboxActivityOptions(mailboxOAuthCompleteActivityTimeout))
+
+	var selection pb.SelectMailboxOAuthAccountsResponse
+	if err := workflow.ExecuteActivity(selectCtx, selectMailboxOAuthAccountsActivityName, &pb.SelectMailboxOAuthAccountsRequest{
+		OperationId:  input.OperationID,
+		EmailAddress: input.EmailAddress,
+		OnlyMissing:  input.OnlyMissing,
+		Limit:        input.Limit,
+	}).Get(ctx, &selection); err != nil {
+		return mailboxOperationResult{OperationID: input.OperationID, Success: false, ErrorMessage: err.Error()}, err
+	}
+
+	results := make([]*pb.MailboxOAuthResult, 0, len(selection.GetAccounts()))
+	for _, account := range selection.GetAccounts() {
+		var accountResult pb.RunMailboxOAuthAccountResponse
+		err := workflow.ExecuteActivity(accountCtx, runMailboxOAuthAccountActivityName, &pb.RunMailboxOAuthAccountRequest{
+			OperationId: input.OperationID,
+			Account:     account,
+		}).Get(ctx, &accountResult)
+		if err != nil {
+			results = append(results, &pb.MailboxOAuthResult{
+				EmailAddress: account.GetEmailAddress(),
+				Success:      false,
+				ErrorMessage: err.Error(),
+			})
+			continue
+		}
+		if accountResult.GetResult() != nil {
+			results = append(results, accountResult.GetResult())
+		}
+	}
+
 	var result mailboxOperationResult
-	err := workflow.ExecuteActivity(ctx, runMailboxOAuthActivityName, input).Get(ctx, &result)
+	err := workflow.ExecuteActivity(completeCtx, completeMailboxOAuthActivityName, &pb.CompleteMailboxOAuthRequest{
+		OperationId: input.OperationID,
+		Accounts:    selection.GetAccounts(),
+		Results:     results,
+	}).Get(ctx, &result)
 	return result, err
 }
 

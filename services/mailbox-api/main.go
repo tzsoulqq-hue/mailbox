@@ -179,6 +179,26 @@ func (s *server) DeleteMailbox(ctx context.Context, req *pb.DeleteMailboxRequest
 	return resp, nil
 }
 
+func (s *server) WaitForMailboxEmail(ctx context.Context, req *pb.WaitForEmailRequest) (*pb.WaitForEmailResponse, error) {
+	email := normalizeEmail(req.GetEmailAddress())
+	if email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email_address is required")
+	}
+	resp, err := s.emailClient.WaitForEmail(ctx, &pb.WaitForEmailRequest{
+		EmailAddress:    email,
+		SubjectKeyword:  strings.TrimSpace(req.GetSubjectKeyword()),
+		TimeoutSeconds:  req.GetTimeoutSeconds(),
+		IssuedAfterUnix: req.GetIssuedAfterUnix(),
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "wait for mailbox email: %v", err)
+	}
+	if resp == nil {
+		return nil, status.Error(codes.Internal, "email service returned empty wait response")
+	}
+	return resp, nil
+}
+
 func (s *server) RegisterMailbox(ctx context.Context, req *pb.RegisterMailboxRequest) (*pb.RegisterMailboxResponse, error) {
 	operationID := operationID("mailbox-register")
 	if _, err := s.operations.create(ctx, operationID, operationActionRegisterMailbox, ""); err != nil {

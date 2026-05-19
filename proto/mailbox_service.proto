@@ -10,6 +10,7 @@ service MailboxService {
   rpc ListMailboxes(email.ListEmailMailboxesRequest) returns (email.ListEmailMailboxesResponse);
   rpc UpsertMailbox(email.UpsertEmailMailboxRequest) returns (email.UpsertEmailMailboxResponse);
   rpc DeleteMailbox(email.DeleteMailboxRequest) returns (email.DeleteMailboxResponse);
+  rpc WaitForMailboxEmail(email.WaitForEmailRequest) returns (email.WaitForEmailResponse);
   rpc RegisterMailbox(RegisterMailboxRequest) returns (RegisterMailboxResponse);
   rpc RunMailboxOAuth(StartMailboxOAuthRequest) returns (StartMailboxOAuthResponse);
   rpc FetchMailboxInboxes(FetchMailboxInboxesRequest) returns (FetchMailboxInboxesResponse);

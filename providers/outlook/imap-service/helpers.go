@@ -81,6 +81,24 @@ func envBool(name string, fallback bool) bool {
 	}
 }
 
+func configuredCloudflareDomains() []string {
+	raw := strings.NewReplacer(",", " ", "\n", " ", "\t", " ").Replace(os.Getenv("MAILBOX_CLOUDFLARE_DOMAINS"))
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, item := range strings.Fields(raw) {
+		domain := strings.Trim(strings.ToLower(strings.TrimSpace(item)), ".")
+		if domain == "" {
+			continue
+		}
+		if _, ok := seen[domain]; ok {
+			continue
+		}
+		seen[domain] = struct{}{}
+		out = append(out, domain)
+	}
+	return out
+}
+
 func normalizeScope(value string) string {
 	return strings.Join(strings.Fields(strings.ReplaceAll(value, ",", " ")), " ")
 }

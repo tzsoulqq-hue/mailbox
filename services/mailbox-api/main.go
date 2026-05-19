@@ -27,6 +27,7 @@ type config struct {
 	pgDSN                 string
 	emailAddr             string
 	browserAutomationAddr string
+	cloudflareDomains     []string
 	outlookRegistration   outlookRegistrationConfig
 	workflowRuntime       workflowruntime.Config
 }
@@ -38,6 +39,7 @@ type server struct {
 	operations        *operationStore
 	workflowClient    client.Client
 	workflowTaskQueue string
+	cloudflareDomains []string
 }
 
 func main() {
@@ -94,6 +96,7 @@ func main() {
 		operations:        operations,
 		workflowClient:    workflowClient,
 		workflowTaskQueue: cfg.workflowRuntime.TaskQueue,
+		cloudflareDomains: cfg.cloudflareDomains,
 	})
 
 	log.Printf("mailbox API listening on %s", cfg.listenAddr)
@@ -112,6 +115,7 @@ func loadConfig() config {
 		pgDSN:                 requiredEnv("MAILBOX_PG_DSN"),
 		emailAddr:             requiredEnv("MAILBOX_EMAIL_PROVIDER_ADDR"),
 		browserAutomationAddr: envDefault("BROWSER_AUTOMATION_ADDR", "browser-automation:50051"),
+		cloudflareDomains:     parseDomainList(os.Getenv("MAILBOX_CLOUDFLARE_DOMAINS")),
 		outlookRegistration:   loadOutlookRegistrationConfig(),
 		workflowRuntime:       workflowRuntime,
 	}
@@ -160,6 +164,11 @@ func (s *server) UpsertMailbox(ctx context.Context, req *pb.UpsertEmailMailboxRe
 	if mailbox.GetPrimaryEmail() == "" {
 		mailbox.PrimaryEmail = mailbox.GetEmailAddress()
 	}
+	if mailbox.GetProvider() == "" {
+		mailbox.Provider = "outlook"
+	} else {
+		mailbox.Provider = normalizeEmailProviderString(mailbox.GetProvider())
+	}
 	resp, err := s.emailClient.UpsertMailbox(ctx, req)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "upsert mailbox: %v", err)
@@ -168,6 +177,22 @@ func (s *server) UpsertMailbox(ctx context.Context, req *pb.UpsertEmailMailboxRe
 		return nil, status.Error(codes.Internal, "email service returned empty mailbox")
 	}
 	return resp, nil
+}
+
+func (s *server) ListMailboxDomains(ctx context.Context, req *pb.ListMailboxDomainsRequest) (*pb.ListMailboxDomainsResponse, error) {
+	provider := req.GetProvider()
+	if provider != pb.MailboxProvider_MAILBOX_PROVIDER_UNSPECIFIED && provider != pb.MailboxProvider_MAILBOX_PROVIDER_CLOUDFLARE {
+		return &pb.ListMailboxDomainsResponse{Domains: []*pb.MailboxDomain{}}, nil
+	}
+	domains := make([]*pb.MailboxDomain, 0, len(s.cloudflareDomains))
+	for _, domain := range s.cloudflareDomains {
+		domains = append(domains, &pb.MailboxDomain{
+			Provider: pb.MailboxProvider_MAILBOX_PROVIDER_CLOUDFLARE,
+			Domain:   domain,
+			Enabled:  true,
+		})
+	}
+	return &pb.ListMailboxDomainsResponse{Domains: domains}, nil
 }
 
 func (s *server) DeleteMailbox(ctx context.Context, req *pb.DeleteMailboxRequest) (*pb.DeleteMailboxResponse, error) {
@@ -359,6 +384,35 @@ func (s *server) updateOperation(ctx context.Context, operationID string, update
 
 func normalizeEmail(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeEmailProviderString(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "cf", "cloudflare", "cloudflare-email-relay":
+		return "cloudflare"
+	case "outlook", "microsoft", "graph":
+		return "outlook"
+	default:
+		return strings.ToLower(strings.TrimSpace(provider))
+	}
+}
+
+func parseDomainList(value string) []string {
+	raw := strings.NewReplacer(",", " ", "\n", " ", "\t", " ").Replace(value)
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, item := range strings.Fields(raw) {
+		domain := strings.Trim(strings.ToLower(strings.TrimSpace(item)), ".")
+		if domain == "" {
+			continue
+		}
+		if _, ok := seen[domain]; ok {
+			continue
+		}
+		seen[domain] = struct{}{}
+		out = append(out, domain)
+	}
+	return out
 }
 
 func normalizedLimit(limit int32) int32 {

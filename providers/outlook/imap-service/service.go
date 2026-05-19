@@ -53,7 +53,7 @@ func (s *EmailService) UpsertMailbox(ctx context.Context, request *pb.UpsertEmai
 }
 
 func (s *EmailService) ListMailboxes(ctx context.Context, request *pb.ListEmailMailboxesRequest) (*pb.ListEmailMailboxesResponse, error) {
-	mailboxes, err := s.store.ListMailboxes(ctx, request.GetAuthStatus(), request.GetLimit())
+	mailboxes, err := s.store.ListMailboxes(ctx, request.GetAuthStatus(), request.GetProvider(), request.GetLimit())
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -144,6 +144,9 @@ func (s *EmailService) WaitForEmail(ctx context.Context, request *pb.WaitForEmai
 	} else if ok {
 		return resp, nil
 	}
+	if s.isWebhookBackedAddress(email) {
+		return s.waitForPersistedEmail(ctx, request, timeoutSeconds, issuedAfterUnix)
+	}
 	if err := s.watcher.PollForEmail(ctx, email); err != nil {
 		if !isAuthError(err) {
 			return nil, waitError(ctx, err)
@@ -184,6 +187,45 @@ func (s *EmailService) WaitForEmail(ctx context.Context, request *pb.WaitForEmai
 	}
 	logInfo("email message not found email=%s timeout_seconds=%d issued_after_unix=%d", redactEmail(email), timeoutSeconds, issuedAfterUnix)
 	return &pb.WaitForEmailResponse{Found: false}, nil
+}
+
+func (s *EmailService) waitForPersistedEmail(ctx context.Context, request *pb.WaitForEmailRequest, timeoutSeconds int32, issuedAfterUnix int64) (*pb.WaitForEmailResponse, error) {
+	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
+	for time.Now().Before(deadline) {
+		sleepFor := time.Duration(s.watcher.pollInterval) * time.Second
+		if remaining := time.Until(deadline); remaining < sleepFor {
+			sleepFor = remaining
+		}
+		if sleepFor > 0 {
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, status.Error(codes.Canceled, "request cancelled")
+			case <-timer.C:
+			}
+		}
+		if resp, ok, err := s.latestEmailResponse(ctx, request, issuedAfterUnix); err != nil {
+			return nil, waitError(ctx, err)
+		} else if ok {
+			return resp, nil
+		}
+	}
+	logInfo("webhook-backed email message not found email=%s timeout_seconds=%d issued_after_unix=%d", redactEmail(request.GetEmailAddress()), timeoutSeconds, issuedAfterUnix)
+	return &pb.WaitForEmailResponse{Found: false}, nil
+}
+
+func (s *EmailService) isWebhookBackedAddress(email string) bool {
+	_, domain, ok := strings.Cut(normalizeEmail(email), "@")
+	if !ok || domain == "" {
+		return false
+	}
+	for _, candidate := range configuredCloudflareDomains() {
+		if domain == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *EmailService) latestEmailResponse(ctx context.Context, request *pb.WaitForEmailRequest, issuedAfterUnix int64) (*pb.WaitForEmailResponse, bool, error) {

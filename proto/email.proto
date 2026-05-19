@@ -20,6 +20,7 @@ message EmailMailbox {
   reserved "latest_otp", "latest_otp_subject", "latest_otp_received_at_unix",
     "latest_otp_provider", "latest_otp_source_mailbox_email";
   string auth_status = 15;
+  string provider = 18;
 }
 
 message MarkEmailAuthStatusRequest {
@@ -45,6 +46,7 @@ message ListEmailMailboxesRequest {
   reserved "status";
   int32 limit = 2;
   string auth_status = 3;
+  string provider = 4;
 }
 
 message ListEmailMailboxesResponse {

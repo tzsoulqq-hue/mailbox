@@ -17,7 +17,7 @@ import (
 )
 
 const selectMailbox = `
-	SELECT id, email, password, refresh_token, access_token, auth_status,
+	SELECT id, email, provider, password, refresh_token, access_token, auth_status,
 		last_error, is_primary, primary_email, created_at, updated_at
 	FROM mailboxes
 `
@@ -25,6 +25,7 @@ const selectMailbox = `
 type mailboxRow struct {
 	ID           string
 	Email        string
+	Provider     string
 	Password     string
 	RefreshToken string
 	AccessToken  string
@@ -132,6 +133,7 @@ func (s *MailboxStore) ensureSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS mailboxes (
 			id TEXT PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
+			provider TEXT NOT NULL DEFAULT 'outlook',
 			password TEXT NOT NULL DEFAULT '',
 			refresh_token TEXT NOT NULL DEFAULT '',
 			access_token TEXT NOT NULL DEFAULT '',
@@ -142,6 +144,7 @@ func (s *MailboxStore) ensureSchema(ctx context.Context) error {
 			created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
 			updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
 		)`,
+		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'outlook'`,
 		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS refresh_token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS access_token TEXT NOT NULL DEFAULT ''`,
@@ -242,6 +245,7 @@ func (s *MailboxStore) ensureSchema(ctx context.Context) error {
 		`DROP INDEX IF EXISTS idx_mailboxes_status`,
 		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS status`,
 		`CREATE INDEX IF NOT EXISTS idx_mailboxes_auth_status ON mailboxes(auth_status)`,
+		`CREATE INDEX IF NOT EXISTS idx_mailboxes_provider ON mailboxes(provider)`,
 		`CREATE INDEX IF NOT EXISTS idx_mailboxes_primary ON mailboxes(primary_email)`,
 		`CREATE INDEX IF NOT EXISTS idx_mailbox_inbox_seen_at ON mailbox_inbox_seen(seen_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_mailbox_inbox_messages_received_at ON mailbox_inbox_messages(mailbox_email, received_at DESC)`,
@@ -262,6 +266,11 @@ func (s *MailboxStore) UpsertMailbox(ctx context.Context, mailbox *pb.EmailMailb
 	email := normalizeEmail(mailbox.GetEmailAddress())
 	if email == "" {
 		return nil, errors.New("email_address is required")
+	}
+	requestedProvider := normalizeEmailProvider(mailbox.GetProvider())
+	insertProvider := requestedProvider
+	if insertProvider == "" {
+		insertProvider = emailProviderOutlook
 	}
 	isPrimary := mailbox.GetIsPrimary()
 	primaryEmail := normalizeEmail(mailbox.GetPrimaryEmail())
@@ -294,19 +303,20 @@ func (s *MailboxStore) UpsertMailbox(ctx context.Context, mailbox *pb.EmailMailb
 
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO mailboxes (
-			id, email, password, refresh_token, access_token, auth_status,
+			id, email, provider, password, refresh_token, access_token, auth_status,
 			last_error, is_primary, primary_email, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (email) DO UPDATE SET
+			provider = CASE WHEN $13 <> '' THEN EXCLUDED.provider ELSE mailboxes.provider END,
 			password = CASE WHEN EXCLUDED.password <> '' THEN EXCLUDED.password ELSE mailboxes.password END,
 			refresh_token = CASE WHEN EXCLUDED.refresh_token <> '' THEN EXCLUDED.refresh_token ELSE mailboxes.refresh_token END,
 			access_token = CASE WHEN EXCLUDED.access_token <> '' THEN EXCLUDED.access_token ELSE mailboxes.access_token END,
-			auth_status = CASE WHEN $12 <> '' THEN EXCLUDED.auth_status WHEN EXCLUDED.refresh_token <> '' THEN 'AUTHORIZED' ELSE mailboxes.auth_status END,
-			last_error = CASE WHEN $12 <> '' OR EXCLUDED.last_error <> '' THEN EXCLUDED.last_error ELSE mailboxes.last_error END,
+			auth_status = CASE WHEN $14 <> '' THEN EXCLUDED.auth_status WHEN EXCLUDED.refresh_token <> '' THEN 'AUTHORIZED' ELSE mailboxes.auth_status END,
+			last_error = CASE WHEN $14 <> '' OR EXCLUDED.last_error <> '' THEN EXCLUDED.last_error ELSE mailboxes.last_error END,
 			is_primary = EXCLUDED.is_primary,
 			primary_email = EXCLUDED.primary_email,
 			updated_at = EXCLUDED.updated_at
-	`, rowID, email, mailbox.GetPassword(), refreshToken, accessToken, insertAuthStatus, lastError, isPrimary, primaryEmail, now, now, requestedAuthStatus)
+	`, rowID, email, insertProvider, mailbox.GetPassword(), refreshToken, accessToken, insertAuthStatus, lastError, isPrimary, primaryEmail, now, now, requestedProvider, requestedAuthStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +336,7 @@ func (s *MailboxStore) UpsertMailbox(ctx context.Context, mailbox *pb.EmailMailb
 	return s.FindMailbox(ctx, email)
 }
 
-func (s *MailboxStore) ListMailboxes(ctx context.Context, authStatus string, limit int32) ([]*pb.EmailMailbox, error) {
+func (s *MailboxStore) ListMailboxes(ctx context.Context, authStatus string, provider string, limit int32) ([]*pb.EmailMailbox, error) {
 	n := int(limit)
 	if n <= 0 {
 		n = 100
@@ -340,8 +350,12 @@ func (s *MailboxStore) ListMailboxes(ctx context.Context, authStatus string, lim
 		args = append(args, trimmed)
 		query += fmt.Sprintf(" AND auth_status = $%d", len(args))
 	}
+	if trimmed := normalizeEmailProvider(provider); trimmed != "" {
+		args = append(args, trimmed)
+		query += fmt.Sprintf(" AND provider = $%d", len(args))
+	}
 	args = append(args, n)
-	query += fmt.Sprintf(" ORDER BY updated_at DESC LIMIT $%d", len(args))
+	query += fmt.Sprintf(" ORDER BY is_primary DESC, updated_at DESC LIMIT $%d", len(args))
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -373,11 +387,12 @@ func (s *MailboxStore) ListOAuthPrimaryMailboxes(ctx context.Context, limit int3
 	}
 	rows, err := s.pool.Query(ctx, selectMailbox+`
 			WHERE is_primary = true
+			AND provider = $1
 			AND refresh_token <> ''
-			AND auth_status = $1
+			AND auth_status = $2
 			ORDER BY updated_at DESC
-			LIMIT $2
-		`, authStatusAuthorized, n)
+			LIMIT $3
+		`, emailProviderOutlook, authStatusAuthorized, n)
 	if err != nil {
 		return nil, err
 	}
@@ -872,6 +887,7 @@ func scanMailbox(scanner rowScanner) (*mailboxRow, error) {
 	err := scanner.Scan(
 		&row.ID,
 		&row.Email,
+		&row.Provider,
 		&row.Password,
 		&row.RefreshToken,
 		&row.AccessToken,
@@ -894,6 +910,7 @@ func (m *mailboxRow) toProto() *pb.EmailMailbox {
 	}
 	return &pb.EmailMailbox{
 		EmailAddress: m.Email,
+		Provider:     normalizeEmailProvider(m.Provider),
 		Password:     m.Password,
 		RefreshToken: m.RefreshToken,
 		AccessToken:  m.AccessToken,

@@ -47,8 +47,3 @@ message RunMailboxOAuthResponse {
   string error_message = 5;
   repeated MailboxOAuthResult results = 6;
 }
-
-service MailboxRegistrationService {
-  rpc RunMailboxRegistration(RunMailboxRegistrationRequest) returns (RunMailboxRegistrationResponse);
-  rpc RunMailboxOAuth(RunMailboxOAuthRequest) returns (RunMailboxOAuthResponse);
-}

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	browserautomationv1 "github.com/byte-v-forge/browser-automation/gen/go/byte/v/forge/contracts/browserautomation/v1"
 	workflowruntime "github.com/byte-v-forge/workflow-runtime"
 	"go.temporal.io/sdk/client"
 	"google.golang.org/grpc"
@@ -22,11 +23,12 @@ import (
 )
 
 type config struct {
-	listenAddr          string
-	pgDSN               string
-	emailAddr           string
-	mailboxRegisterAddr string
-	temporal            workflowruntime.Config
+	listenAddr            string
+	pgDSN                 string
+	emailAddr             string
+	browserAutomationAddr string
+	outlookRegistration   outlookRegistrationConfig
+	temporal              workflowruntime.Config
 }
 
 type server struct {
@@ -46,11 +48,11 @@ func main() {
 	}
 	defer emailConn.Close()
 
-	registerConn, err := newGRPCClient("mailbox registration service", cfg.mailboxRegisterAddr)
+	browserConn, err := newGRPCClient("browser automation", cfg.browserAutomationAddr)
 	if err != nil {
-		log.Fatalf("failed to connect mailbox registration service: %v", err)
+		log.Fatalf("failed to connect browser automation: %v", err)
 	}
-	defer registerConn.Close()
+	defer browserConn.Close()
 
 	operations, err := newOperationStore(cfg.pgDSN)
 	if err != nil {
@@ -64,9 +66,13 @@ func main() {
 	defer temporalClient.Close()
 
 	activities := &mailboxActivities{
-		mailboxRegisterClient: pb.NewMailboxRegistrationServiceClient(registerConn),
-		emailClient:           pb.NewEmailServiceClient(emailConn),
-		operations:            operations,
+		outlookRegistration: newOutlookRegistrationRunner(
+			cfg.outlookRegistration,
+			browserautomationv1.NewBrowserAutomationServiceClient(browserConn),
+			nil,
+		),
+		emailClient: pb.NewEmailServiceClient(emailConn),
+		operations:  operations,
 	}
 	worker, err := workflowruntime.NewWorker(temporalClient, mailboxWorkerSpec(cfg.temporal.TaskQueue, activities))
 	if err != nil {
@@ -102,11 +108,12 @@ func loadConfig() config {
 		log.Fatalf("load Temporal config: %v", err)
 	}
 	return config{
-		listenAddr:          envDefault("LISTEN_ADDR", ":50051"),
-		pgDSN:               requiredEnv("MAILBOX_API_PG_DSN"),
-		emailAddr:           requiredEnv("MAILBOX_EMAIL_SERVICE_ADDR"),
-		mailboxRegisterAddr: requiredEnv("MAILBOX_REGISTER_ADDR"),
-		temporal:            temporal,
+		listenAddr:            envDefault("LISTEN_ADDR", ":50051"),
+		pgDSN:                 requiredEnv("MAILBOX_API_PG_DSN"),
+		emailAddr:             requiredEnv("MAILBOX_EMAIL_SERVICE_ADDR"),
+		browserAutomationAddr: envDefault("BROWSER_AUTOMATION_ADDR", "browser-automation:50051"),
+		outlookRegistration:   loadOutlookRegistrationConfig(),
+		temporal:              temporal,
 	}
 }
 

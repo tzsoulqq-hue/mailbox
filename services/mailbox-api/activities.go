@@ -22,9 +22,9 @@ const (
 )
 
 type mailboxActivities struct {
-	mailboxRegisterClient pb.MailboxRegistrationServiceClient
-	emailClient           pb.EmailServiceClient
-	operations            *operationStore
+	outlookRegistration *outlookRegistrationRunner
+	emailClient         pb.EmailServiceClient
+	operations          *operationStore
 }
 
 func (a *mailboxActivities) RunMailboxRegistration(ctx context.Context, input registerMailboxWorkflowInput) (mailboxOperationResult, error) {
@@ -33,7 +33,7 @@ func (a *mailboxActivities) RunMailboxRegistration(ctx context.Context, input re
 		return mailboxOperationResult{OperationID: operationID, ErrorMessage: err.Error()}, err
 	}
 
-	resp, err := a.mailboxRegisterClient.RunMailboxRegistration(ctx, &pb.RunMailboxRegistrationRequest{
+	resp, err := a.outlookRegistration.RunMailboxRegistration(ctx, &pb.RunMailboxRegistrationRequest{
 		Enabled:    !input.ImportOnly,
 		ImportOnly: input.ImportOnly,
 	})
@@ -47,7 +47,7 @@ func (a *mailboxActivities) RunMailboxRegistration(ctx context.Context, input re
 		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, workflowruntime.NewRetryableActivityError(activityErrorMailboxRegistrationUnavailable, message, err)
 	}
 	if resp == nil {
-		message := "mailbox registration service returned empty response"
+		message := "mailbox registration runner returned empty response"
 		a.updateOperation(ctx, operationID, operationUpdate{
 			Status:       operationStatusFailed,
 			LastStep:     "run_registration",
@@ -93,7 +93,7 @@ func (a *mailboxActivities) RunMailboxOAuth(ctx context.Context, input mailboxOA
 		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, nil
 	}
 
-	resp, err := a.mailboxRegisterClient.RunMailboxOAuth(ctx, &pb.RunMailboxOAuthRequest{
+	resp, err := a.outlookRegistration.RunMailboxOAuth(ctx, &pb.RunMailboxOAuthRequest{
 		EmailAddress: normalizeEmail(input.EmailAddress),
 		OnlyMissing:  input.OnlyMissing,
 		Limit:        normalizedLimit(input.Limit),
@@ -109,7 +109,7 @@ func (a *mailboxActivities) RunMailboxOAuth(ctx context.Context, input mailboxOA
 		return mailboxOperationResult{OperationID: operationID, Success: false, ErrorMessage: message}, workflowruntime.NewRetryableActivityError(activityErrorMailboxOAuthUnavailable, message, err)
 	}
 	if resp == nil {
-		message := "mailbox registration service returned empty OAuth response"
+		message := "mailbox registration runner returned empty OAuth response"
 		a.updateOperation(ctx, operationID, operationUpdate{
 			Status:       operationStatusFailed,
 			LastStep:     "run_oauth",

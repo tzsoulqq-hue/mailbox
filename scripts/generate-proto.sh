@@ -21,8 +21,3 @@ protoc -I "$ROOT/proto" \
   "$ROOT/proto/email.proto" \
   "$ROOT/proto/mailbox_register.proto" \
   "$ROOT/proto/mailbox_service.proto"
-
-python3 -m grpc_tools.protoc -I "$ROOT/proto" \
-  --python_out="$ROOT/providers/outlook/register-service" \
-  --grpc_python_out="$ROOT/providers/outlook/register-service" \
-  "$ROOT/proto/mailbox_register.proto"

@@ -78,8 +78,8 @@ func loadOutlookRegistrationConfig() outlookRegistrationConfig {
 		acceptLanguage: envDefault("OUTLOOK_REGISTER_AUTOMATION_ACCEPT_LANGUAGE", acceptLanguage(locale)),
 		timezone:       envDefault("OUTLOOK_REGISTER_AUTOMATION_TIMEZONE", ""),
 		userAgent:      envDefault("OUTLOOK_REGISTER_AUTOMATION_USER_AGENT", ""),
-		windowWidth:    envInt("OUTLOOK_REGISTER_AUTOMATION_WINDOW_WIDTH", defaultOutlookBrowserViewportWide),
-		windowHeight:   envInt("OUTLOOK_REGISTER_AUTOMATION_WINDOW_HEIGHT", defaultOutlookBrowserViewportHigh),
+		windowWidth:    envPositiveInt("OUTLOOK_REGISTER_AUTOMATION_WINDOW_WIDTH", defaultOutlookBrowserViewportWide),
+		windowHeight:   envPositiveInt("OUTLOOK_REGISTER_AUTOMATION_WINDOW_HEIGHT", defaultOutlookBrowserViewportHigh),
 		sessionTTL:     envDurationSeconds("OUTLOOK_REGISTER_AUTOMATION_SESSION_TTL_SECONDS", defaultOutlookBrowserSessionTTL),
 		commandTimeout: envDurationSeconds("OUTLOOK_REGISTER_AUTOMATION_COMMAND_TIMEOUT_SECONDS", defaultOutlookCommandTimeout),
 		oauthClientID:  envDefault("OUTLOOK_REGISTER_OAUTH_CLIENT_ID", defaultOutlookOAuthClientID),
@@ -559,7 +559,7 @@ func acceptLanguage(locale string) string {
 	return "en-US,en;q=0.9"
 }
 
-func envInt(name string, fallback int) int {
+func envPositiveInt(name string, fallback int) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
 		return fallback
@@ -580,7 +580,7 @@ func envBool(name string, fallback bool) bool {
 }
 
 func envDurationSeconds(name string, fallback time.Duration) time.Duration {
-	return time.Duration(envInt(name, int(fallback/time.Second))) * time.Second
+	return time.Duration(envPositiveInt(name, int(fallback/time.Second))) * time.Second
 }
 
 func sanitizeURL(value string) string {

@@ -13,7 +13,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/protojson"
 
-	"outlookimapservice/pb"
+	"mailboxapi/pb"
 )
 
 type graphWebhookHandler struct {
@@ -46,7 +46,7 @@ func startWebhookServer(ctx context.Context, addr string, store *MailboxStore, w
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhooks/email/cloudflare", handler.handleCloudflareEmail)
-	mux.HandleFunc("/webhooks/microsoft-graph/outlook", handler.handleGraphNotification)
+	mux.HandleFunc("/webhooks/email/microsoft-graph", handler.handleGraphNotification)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -93,17 +93,23 @@ func (h *graphWebhookHandler) handleCloudflareEmail(w http.ResponseWriter, r *ht
 		return
 	}
 	event.Provider = emailProviderCloudflare
-	if err := h.store.RecordInboundEmail(r.Context(), &event); err != nil {
+	messages, err := h.store.RecordInboundEmail(r.Context(), &event)
+	if err != nil {
 		logWarning("record Cloudflare email webhook: %v", err)
 		http.Error(w, "record email event failed", http.StatusInternalServerError)
 		return
 	}
+	h.watcher.DispatchMailboxEvents(messages)
 	logInfo("recorded Cloudflare email event recipients=%d message_id=%s", len(event.GetRecipients()), event.GetMessageId())
 	w.WriteHeader(http.StatusAccepted)
 }
 
 func (h *graphWebhookHandler) handleGraphNotification(w http.ResponseWriter, r *http.Request) {
 	if token := r.URL.Query().Get("validationToken"); token != "" {
+		if !validGraphWebhookRequestToken(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte(token))
 		return
@@ -126,6 +132,10 @@ func (h *graphWebhookHandler) handleGraphNotification(w http.ResponseWriter, r *
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
+	if !validGraphWebhookClientState(envelope) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	logInfo("received Outlook Graph webhook notifications=%d", len(envelope.Value))
 	h.triggerRefresh()
 	w.WriteHeader(http.StatusAccepted)
@@ -138,11 +148,48 @@ func validWebhookToken(r *http.Request) bool {
 		return false
 	}
 	token := strings.TrimSpace(r.Header.Get(defaultWebhookTokenHeader))
+	return token == expected
+}
+
+func validGraphWebhookClientState(envelope graphNotificationEnvelope) bool {
+	expected := webhookSecret()
+	if expected == "" {
+		logWarning("MAILBOX_WEBHOOK_TOKEN is required for Graph webhook ingestion")
+		return false
+	}
+	if len(envelope.Value) == 0 {
+		return false
+	}
+	for _, notification := range envelope.Value {
+		if strings.TrimSpace(notification.ClientState) != expected {
+			return false
+		}
+	}
+	return true
+}
+
+func validGraphWebhookRequestToken(r *http.Request) bool {
+	expected := webhookSecret()
+	if expected == "" {
+		logWarning("MAILBOX_WEBHOOK_TOKEN is required for Graph webhook validation")
+		return false
+	}
+	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("webhook_token"))
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get(defaultWebhookTokenHeader))
+	}
 	if token == "" {
 		auth := strings.TrimSpace(r.Header.Get("Authorization"))
 		token = strings.TrimPrefix(auth, "Bearer ")
 	}
 	return token == expected
+}
+
+func webhookSecret() string {
+	return strings.TrimSpace(os.Getenv("MAILBOX_WEBHOOK_TOKEN"))
 }
 
 func (h *graphWebhookHandler) triggerRefresh() {
@@ -169,7 +216,7 @@ func (h *graphWebhookHandler) refreshMailboxes() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	mailboxes, err := h.watcher.store.ListOAuthPrimaryMailboxes(ctx, int32(limit))
+	mailboxes, err := h.watcher.store.ListOAuthMailboxes(ctx, int32(limit))
 	if err != nil {
 		logWarning("list OAuth mailboxes for webhook refresh: %v", err)
 		return
@@ -177,7 +224,7 @@ func (h *graphWebhookHandler) refreshMailboxes() {
 	fetched := 0
 	failed := 0
 	for _, mailbox := range mailboxes {
-		if _, err := h.watcher.FetchMailboxInbox(ctx, mailbox, int32(h.watcher.messageLimit)); err != nil {
+		if _, err := h.watcher.FetchMailboxInbox(ctx, mailbox, int32(h.watcher.messageLimit), 0); err != nil {
 			failed++
 			logWarning("webhook mailbox refresh failed for %s: %v", redactEmail(mailbox.GetEmailAddress()), err)
 			continue

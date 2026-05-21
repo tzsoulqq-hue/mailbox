@@ -17,13 +17,14 @@ const (
 	activityErrorMailboxOAuthUnavailable        = "MAILBOX_OAUTH_UNAVAILABLE"
 	activityErrorMailboxOAuthEmpty              = "MAILBOX_OAUTH_EMPTY"
 	emailAuthAuthorized                         = "AUTHORIZED"
+	emailAuthOAuthPending                       = "OAUTH_PENDING"
 	emailAuthFailed                             = "AUTH_FAILED"
 	emailAuthNeedsManualVerification            = "NEEDS_MANUAL_VERIFICATION"
 )
 
 type mailboxActivities struct {
 	outlookRegistration *outlookRegistrationRunner
-	emailClient         pb.EmailServiceClient
+	emailBackend        emailBackend
 	operations          *operationStore
 }
 
@@ -229,8 +230,6 @@ func (a *mailboxActivities) persistRegisteredAccounts(ctx context.Context, accou
 			AccessToken:  strings.TrimSpace(account.GetAccessToken()),
 			AuthStatus:   mailboxAuthStatus(account.GetRefreshToken(), ""),
 			LastError:    "",
-			IsPrimary:    true,
-			PrimaryEmail: email,
 		}); err != nil {
 			return err
 		}
@@ -244,7 +243,7 @@ func (a *mailboxActivities) oauthAccounts(ctx context.Context, emailAddress stri
 	if requestedEmail != "" {
 		selectedLimit = 500
 	}
-	resp, err := a.emailClient.ListMailboxes(ctx, &pb.ListEmailMailboxesRequest{Limit: selectedLimit})
+	resp, err := a.emailBackend.ListMailboxes(ctx, &pb.ListEmailMailboxesRequest{Limit: selectedLimit})
 	if err != nil {
 		return nil, fmt.Errorf("list mailboxes: %w", err)
 	}
@@ -258,9 +257,6 @@ func (a *mailboxActivities) oauthAccounts(ctx context.Context, emailAddress stri
 			continue
 		}
 		if requestedEmail != "" && email != requestedEmail {
-			continue
-		}
-		if !mailbox.GetIsPrimary() {
 			continue
 		}
 		if strings.TrimSpace(mailbox.GetPassword()) == "" {
@@ -291,10 +287,10 @@ func (a *mailboxActivities) oauthAccounts(ctx context.Context, emailAddress stri
 }
 
 func (a *mailboxActivities) persistOAuthResults(ctx context.Context, results []*pb.MailboxOAuthResult, accounts []*pb.MailboxRegistrationAccount) error {
-	passwordByEmail := make(map[string]string, len(accounts))
+	accountByEmail := make(map[string]*pb.MailboxRegistrationAccount, len(accounts))
 	for _, account := range accounts {
 		if email := normalizeEmail(account.GetEmailAddress()); email != "" {
-			passwordByEmail[email] = strings.TrimSpace(account.GetPassword())
+			accountByEmail[email] = account
 		}
 	}
 	for _, result := range results {
@@ -303,23 +299,32 @@ func (a *mailboxActivities) persistOAuthResults(ctx context.Context, results []*
 			continue
 		}
 		refreshToken := strings.TrimSpace(result.GetRefreshToken())
+		account := accountByEmail[email]
+		password := ""
+		existingRefreshToken := ""
+		if account != nil {
+			password = strings.TrimSpace(account.GetPassword())
+			existingRefreshToken = strings.TrimSpace(account.GetRefreshToken())
+		}
 		if result.GetSuccess() && refreshToken != "" {
 			if err := a.upsertMailbox(ctx, &pb.EmailMailbox{
 				EmailAddress: email,
-				Password:     passwordByEmail[email],
+				Password:     password,
 				RefreshToken: refreshToken,
 				AccessToken:  strings.TrimSpace(result.GetAccessToken()),
 				AuthStatus:   emailAuthAuthorized,
 				LastError:    "",
-				IsPrimary:    true,
-				PrimaryEmail: email,
 			}); err != nil {
 				return err
 			}
 			continue
 		}
 		if !result.GetSuccess() {
-			if err := a.markEmailAuthStatus(ctx, email, mailboxOAuthFailureStatus(result.GetErrorMessage()), result.GetErrorMessage()); err != nil {
+			authStatus := mailboxOAuthFailureStatus(result.GetErrorMessage())
+			if mailboxOAuthFailureIsRuntime(result.GetErrorMessage()) && existingRefreshToken != "" {
+				authStatus = emailAuthAuthorized
+			}
+			if err := a.markEmailAuthStatus(ctx, email, authStatus, result.GetErrorMessage()); err != nil {
 				return err
 			}
 		}
@@ -328,7 +333,7 @@ func (a *mailboxActivities) persistOAuthResults(ctx context.Context, results []*
 }
 
 func (a *mailboxActivities) upsertMailbox(ctx context.Context, mailbox *pb.EmailMailbox) error {
-	resp, err := a.emailClient.UpsertMailbox(ctx, &pb.UpsertEmailMailboxRequest{Mailbox: mailbox})
+	resp, err := a.emailBackend.UpsertMailbox(ctx, &pb.UpsertEmailMailboxRequest{Mailbox: mailbox})
 	if err != nil {
 		return fmt.Errorf("upsert mailbox %s: %w", normalizeEmail(mailbox.GetEmailAddress()), err)
 	}
@@ -339,7 +344,7 @@ func (a *mailboxActivities) upsertMailbox(ctx context.Context, mailbox *pb.Email
 }
 
 func (a *mailboxActivities) markEmailAuthStatus(ctx context.Context, email string, authStatus string, lastError string) error {
-	resp, err := a.emailClient.MarkEmailAuthStatus(ctx, &pb.MarkEmailAuthStatusRequest{
+	resp, err := a.emailBackend.MarkEmailAuthStatus(ctx, &pb.MarkEmailAuthStatusRequest{
 		EmailAddress: normalizeEmail(email),
 		AuthStatus:   authStatus,
 		LastError:    strings.TrimSpace(lastError),
@@ -365,8 +370,21 @@ func mailboxAuthStatus(refreshToken string, explicitStatus string) string {
 
 func mailboxOAuthFailureStatus(errorMessage string) string {
 	errorText := strings.ToLower(strings.TrimSpace(errorMessage))
+	if mailboxOAuthFailureIsRuntime(errorMessage) {
+		return emailAuthOAuthPending
+	}
 	if strings.Contains(errorText, "needs_manual_verification") || strings.Contains(errorText, "account.live.com/abuse") {
 		return emailAuthNeedsManualVerification
 	}
 	return emailAuthFailed
+}
+
+func mailboxOAuthFailureIsRuntime(errorMessage string) bool {
+	errorText := strings.ToLower(strings.TrimSpace(errorMessage))
+	return strings.Contains(errorText, "camoufox") ||
+		strings.Contains(errorText, "browserserverimpl.js") ||
+		strings.Contains(errorText, "server process terminated unexpectedly") ||
+		strings.Contains(errorText, "browser automation") ||
+		strings.Contains(errorText, "browser unavailable") ||
+		strings.Contains(errorText, "me-token-to-replace")
 }

@@ -12,8 +12,12 @@ service MailboxService {
   rpc DeleteMailbox(email.DeleteMailboxRequest) returns (email.DeleteMailboxResponse);
   rpc WaitForMailboxEmail(email.WaitForEmailRequest) returns (email.WaitForEmailResponse);
   rpc ListMailboxDomains(ListMailboxDomainsRequest) returns (ListMailboxDomainsResponse);
+  rpc SyncMailboxDomains(SyncMailboxDomainsRequest) returns (SyncMailboxDomainsResponse);
+  rpc ListMailboxProviderCapabilities(ListMailboxProviderCapabilitiesRequest) returns (ListMailboxProviderCapabilitiesResponse);
   rpc RegisterMailbox(RegisterMailboxRequest) returns (RegisterMailboxResponse);
   rpc RunMailboxOAuth(StartMailboxOAuthRequest) returns (StartMailboxOAuthResponse);
+  rpc ListMailboxInbox(ListMailboxInboxRequest) returns (ListMailboxInboxResponse);
+  rpc StreamMailboxEmailEvents(StreamMailboxEmailEventsRequest) returns (stream StreamMailboxEmailEventsResponse);
   rpc FetchMailboxInboxes(FetchMailboxInboxesRequest) returns (FetchMailboxInboxesResponse);
   rpc GetMailboxOperation(GetMailboxOperationRequest) returns (GetMailboxOperationResponse);
   rpc ListMailboxOperations(ListMailboxOperationsRequest) returns (ListMailboxOperationsResponse);
@@ -31,12 +35,82 @@ message MailboxDomain {
   bool enabled = 3;
 }
 
+message CloudflareEmailZone {
+  string zone_id = 1;
+  string zone_name = 2;
+  optional bool enabled = 3;
+  string worker_name = 4;
+  optional bool catch_all_enabled = 5;
+  reserved 6;
+  reserved "domains";
+}
+
+message CloudflareEmailConfig {
+  repeated CloudflareEmailZone zones = 1;
+  string api_base_url = 2;
+}
+
 message ListMailboxDomainsRequest {
   MailboxProvider provider = 1;
 }
 
 message ListMailboxDomainsResponse {
   repeated MailboxDomain domains = 1;
+  string error_message = 2;
+}
+
+message SyncMailboxDomainsRequest {
+  MailboxProvider provider = 1;
+}
+
+message SyncMailboxDomainsResponse {
+  repeated MailboxDomain domains = 1;
+  int32 synced_count = 2;
+  string error_message = 3;
+}
+
+enum MailboxMessageRetentionScope {
+  MAILBOX_MESSAGE_RETENTION_SCOPE_UNSPECIFIED = 0;
+  MAILBOX_MESSAGE_RETENTION_SCOPE_MAILBOX = 1;
+  MAILBOX_MESSAGE_RETENTION_SCOPE_DOMAIN = 2;
+}
+
+enum MailboxProviderAction {
+  MAILBOX_PROVIDER_ACTION_UNSPECIFIED = 0;
+  MAILBOX_PROVIDER_ACTION_IMPORT_MAILBOX = 1;
+  MAILBOX_PROVIDER_ACTION_RUN_OAUTH = 2;
+  MAILBOX_PROVIDER_ACTION_FETCH_INBOX = 3;
+  MAILBOX_PROVIDER_ACTION_RECEIVE_WEBHOOK = 4;
+  MAILBOX_PROVIDER_ACTION_AUTO_CREATE_MAILBOX = 5;
+  MAILBOX_PROVIDER_ACTION_SYNC_DOMAINS = 6;
+}
+
+message MailboxMessageRetentionPolicy {
+  MailboxMessageRetentionScope scope = 1;
+  int32 max_messages = 2;
+}
+
+message MailboxProviderActionCapability {
+  MailboxProviderAction action = 1;
+  repeated string required_mailbox_fields = 2;
+  repeated string required_auth_statuses = 3;
+  bool bulk_supported = 4;
+}
+
+message MailboxProviderCapabilities {
+  MailboxProvider provider = 1;
+  string key = 2;
+  string display_name = 3;
+  repeated MailboxProviderActionCapability actions = 4;
+  MailboxMessageRetentionPolicy retention_policy = 5;
+}
+
+message ListMailboxProviderCapabilitiesRequest {
+  MailboxProvider provider = 1;
+}
+
+message ListMailboxProviderCapabilitiesResponse {
+  repeated MailboxProviderCapabilities providers = 1;
   string error_message = 2;
 }
 
@@ -69,6 +143,31 @@ message FetchMailboxInboxesRequest {
   int32 limit_per_mailbox = 1;
   int32 max_mailboxes = 2;
   string email_address = 3;
+  string parser_profile = 4;
+  int64 received_after_unix = 5;
+}
+
+message ListMailboxInboxRequest {
+  string email_address = 1;
+  int32 limit = 2;
+  string parser_profile = 3;
+}
+
+message ListMailboxInboxResponse {
+  email.FetchMailboxInboxResult result = 1;
+  string error_message = 2;
+}
+
+message StreamMailboxEmailEventsRequest {
+  string email_address = 1;
+  string subject_keyword = 2;
+  string parser_profile = 3;
+  email.EmailSignalKind signal_kind = 4;
+}
+
+message StreamMailboxEmailEventsResponse {
+  string email_address = 1;
+  email.EmailInboxMessage message = 2;
 }
 
 message FetchMailboxInboxesResponse {
@@ -78,6 +177,34 @@ message FetchMailboxInboxesResponse {
   int32 failed_count = 4;
   int32 message_count = 5;
   string operation_id = 6;
+}
+
+message MailboxEmailEventFilter {
+  repeated MailboxProvider providers = 1;
+  repeated string recipient_emails = 2;
+  repeated string recipient_domains = 3;
+  repeated string sender_emails = 4;
+  repeated string sender_domains = 5;
+  repeated string subject_keywords = 6;
+  repeated email.EmailSignalKind signal_kinds = 7;
+}
+
+message OutboundEmailWebhook {
+  string name = 1;
+  string url = 2;
+  string token_env = 3;
+  MailboxEmailEventFilter filter = 4;
+  bool include_body = 5;
+  int32 preview_limit = 6;
+}
+
+message OutboundEmailWebhookList {
+  repeated OutboundEmailWebhook webhooks = 1;
+}
+
+message OutboundEmailWebhookEvent {
+  string event_type = 1;
+  email.EmailInboxMessage message = 2;
 }
 
 message MailboxOperation {

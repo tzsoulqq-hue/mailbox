@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"outlookimapservice/pb"
+	"mailboxapi/pb"
 )
 
 type oauthEntry struct {
@@ -31,6 +31,8 @@ type MailWatcher struct {
 	pollInterval int
 	inboxOverlap int
 	httpClient   *http.Client
+	outbound     *mailboxEventDispatcher
+	events       *mailboxEmailEventBus
 
 	mu            sync.Mutex
 	oauthManagers map[string]oauthEntry
@@ -58,7 +60,7 @@ func (e *GraphFetchError) Retryable() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= http.StatusInternalServerError
 }
 
-func NewMailWatcher(store *MailboxStore) *MailWatcher {
+func NewMailWatcher(store *MailboxStore, events *mailboxEmailEventBus) *MailWatcher {
 	messageLimit := envInt("OUTLOOK_MESSAGE_LIMIT", defaultMessageLimit)
 	if messageLimit < 1 {
 		messageLimit = 1
@@ -85,6 +87,8 @@ func NewMailWatcher(store *MailboxStore) *MailWatcher {
 		pollInterval:  pollInterval,
 		inboxOverlap:  inboxOverlap,
 		httpClient:    &http.Client{Timeout: time.Duration(timeout) * time.Second},
+		outbound:      newMailboxEventDispatcherFromEnv(),
+		events:        events,
 		oauthManagers: map[string]oauthEntry{},
 	}
 }
@@ -98,11 +102,15 @@ func (w *MailWatcher) PollForEmail(ctx context.Context, email string) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.store.RecordInboxMessages(ctx, mailbox.GetEmailAddress(), messages)
-	return err
+	unseen, err := w.store.RecordInboxMessages(ctx, mailbox.GetEmailAddress(), messages)
+	if err != nil {
+		return err
+	}
+	w.DispatchMailboxEvents(unseen)
+	return nil
 }
 
-func (w *MailWatcher) FetchMailboxInbox(ctx context.Context, mailbox *pb.EmailMailbox, limit int32) ([]*pb.EmailInboxMessage, error) {
+func (w *MailWatcher) FetchMailboxInbox(ctx context.Context, mailbox *pb.EmailMailbox, limit int32, receivedAfterUnix int64) ([]*pb.EmailInboxMessage, error) {
 	watermark, err := w.store.InboxWatermark(ctx, mailbox.GetEmailAddress())
 	if err != nil {
 		return nil, err
@@ -124,8 +132,18 @@ func (w *MailWatcher) FetchMailboxInbox(ctx context.Context, mailbox *pb.EmailMa
 	if err != nil {
 		return nil, err
 	}
-	_ = unseen
-	return w.store.ListInboxMessages(ctx, mailbox.GetEmailAddress(), int32(messageLimit))
+	w.DispatchMailboxEvents(unseen)
+	return w.store.ListInboxMessagesSince(ctx, mailbox.GetEmailAddress(), int32(messageLimit), receivedAfterUnix)
+}
+
+func (w *MailWatcher) DispatchMailboxEvents(messages []*pb.EmailInboxMessage) {
+	if len(messages) == 0 {
+		return
+	}
+	w.outbound.Dispatch(messages)
+	if w.events != nil {
+		w.events.Publish(messages)
+	}
 }
 
 func (w *MailWatcher) fetchMailboxMessages(ctx context.Context, mailbox *pb.EmailMailbox, limit int, receivedAfterNs int64) ([]graphMessage, error) {
@@ -214,6 +232,13 @@ func (w *MailWatcher) fetchRecentMessages(ctx context.Context, accessToken strin
 }
 
 func (w *MailWatcher) fetchOnce(ctx context.Context, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
+	if strings.TrimSpace(w.graphURL) == defaultGraphMessagesURL {
+		return w.fetchOnceWithGraphSDK(ctx, accessToken, limit, receivedAfterNs)
+	}
+	return w.fetchOnceREST(ctx, accessToken, limit, receivedAfterNs)
+}
+
+func (w *MailWatcher) fetchOnceREST(ctx context.Context, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
 	u, err := url.Parse(w.graphURL)
 	if err != nil {
 		return nil, err

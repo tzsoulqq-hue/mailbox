@@ -3,7 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"math/big"
+	"log"
 	"os"
 	"regexp"
 	"strconv"
@@ -13,8 +13,6 @@ import (
 
 const (
 	defaultListenAddr          = ":50051"
-	defaultFRPConfigFile       = "/etc/frp/frpc.toml"
-	defaultFRPBinary           = "frpc"
 	defaultWebhookTokenHeader  = "X-Webhook-Token"
 	defaultOAuthClientID       = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 	defaultOAuthScope          = "https://graph.microsoft.com/Mail.Read"
@@ -24,9 +22,10 @@ const (
 	defaultMessageLimit        = 25
 	defaultHTTPTimeoutSeconds  = 20
 	defaultInboxOverlapSeconds = 120
-	defaultAliasTokenLength    = 6
 	defaultWebhookMaxMailboxes = 100
 	defaultWebhookTimeout      = 60
+	defaultOutlookMaxMessages  = 100
+	defaultCloudflareMaxDomain = 500
 )
 
 const (
@@ -66,37 +65,12 @@ func envInt(name string, fallback int) int {
 	return n
 }
 
-func envBool(name string, fallback bool) bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
-	if value == "" {
-		return fallback
-	}
-	switch value {
-	case "1", "true", "yes", "y", "on":
-		return true
-	case "0", "false", "no", "n", "off":
-		return false
-	default:
-		return fallback
-	}
+func logInfo(format string, args ...any) {
+	log.Printf("[MAIL] "+format, args...)
 }
 
-func configuredCloudflareDomains() []string {
-	raw := strings.NewReplacer(",", " ", "\n", " ", "\t", " ").Replace(os.Getenv("MAILBOX_CLOUDFLARE_DOMAINS"))
-	out := []string{}
-	seen := map[string]struct{}{}
-	for _, item := range strings.Fields(raw) {
-		domain := strings.Trim(strings.ToLower(strings.TrimSpace(item)), ".")
-		if domain == "" {
-			continue
-		}
-		if _, ok := seen[domain]; ok {
-			continue
-		}
-		seen[domain] = struct{}{}
-		out = append(out, domain)
-	}
-	return out
+func logWarning(format string, args ...any) {
+	log.Printf("[MAIL] WARNING "+format, args...)
 }
 
 func normalizeScope(value string) string {
@@ -163,20 +137,4 @@ func randomHex(bytes int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-func randomAliasToken(length int) (string, error) {
-	if length <= 0 {
-		length = defaultAliasTokenLength
-	}
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	var b strings.Builder
-	for i := 0; i < length; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
-		if err != nil {
-			return "", err
-		}
-		b.WriteByte(alphabet[n.Int64()])
-	}
-	return b.String(), nil
 }

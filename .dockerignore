@@ -5,8 +5,4 @@
 **/*.log
 **/*.test
 **/*.out
-providers/outlook/imap-service/pb/
-providers/outlook/imap-service/register-results/
-providers/outlook/imap-service/tokens/
-providers/outlook/register-service/.tmp_outlook_register/
-providers/outlook/register-service/register-results/
+services/mailbox-api/pb/

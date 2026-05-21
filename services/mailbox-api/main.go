@@ -8,10 +8,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
-	browserautomationv1 "github.com/byte-v-forge/browser-automation/gen/go/byte/v/forge/contracts/browserautomation/v1"
 	workflowruntime "github.com/byte-v-forge/workflow-runtime"
 	"go.temporal.io/sdk/client"
 	"google.golang.org/grpc"
@@ -19,42 +20,50 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	browserautomationv1 "github.com/byte-v-forge/browser-automation/gen/go/byte/v/forge/contracts/browserautomation/v1"
+
 	"mailboxapi/pb"
 )
 
 type config struct {
 	listenAddr            string
 	pgDSN                 string
-	emailAddr             string
+	webhookHTTPAddr       string
 	browserAutomationAddr string
-	cloudflareDomains     []string
-	outlookRegistration   outlookRegistrationConfig
+	providers             mailboxProviderRuntimeConfig
 	workflowRuntime       workflowruntime.Config
 }
 
 type server struct {
 	pb.UnimplementedMailboxServiceServer
 
-	emailClient       pb.EmailServiceClient
+	emailBackend      emailBackend
 	operations        *operationStore
 	workflowClient    client.Client
 	workflowTaskQueue string
-	cloudflareDomains []string
+	providers         mailboxProviderRuntimeConfig
+	emailEvents       *mailboxEmailEventBus
 }
 
 func main() {
 	cfg := loadConfig()
-	emailConn, err := newGRPCClient("email service", cfg.emailAddr)
-	if err != nil {
-		log.Fatalf("failed to connect email service: %v", err)
-	}
-	defer emailConn.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	browserConn, err := newGRPCClient("browser automation", cfg.browserAutomationAddr)
 	if err != nil {
 		log.Fatalf("failed to connect browser automation: %v", err)
 	}
 	defer browserConn.Close()
+
+	mailboxStore, err := NewMailboxStore(ctx, cfg.pgDSN)
+	if err != nil {
+		log.Fatalf("failed to initialize mailbox store: %v", err)
+	}
+	defer mailboxStore.Close()
+	emailEvents := newMailboxEmailEventBus()
+	mailWatcher := NewMailWatcher(mailboxStore, emailEvents)
+	emailBackend := &EmailService{store: mailboxStore, watcher: mailWatcher, providers: cfg.providers}
 
 	operations, err := newOperationStore(cfg.pgDSN)
 	if err != nil {
@@ -67,15 +76,7 @@ func main() {
 	}
 	defer workflowClient.Close()
 
-	activities := &mailboxActivities{
-		outlookRegistration: newOutlookRegistrationRunner(
-			cfg.outlookRegistration,
-			browserautomationv1.NewBrowserAutomationServiceClient(browserConn),
-			nil,
-		),
-		emailClient: pb.NewEmailServiceClient(emailConn),
-		operations:  operations,
-	}
+	activities := newMailboxActivitiesForProviders(cfg.providers, browserautomationv1.NewBrowserAutomationServiceClient(browserConn), emailBackend, operations)
 	worker, err := workflowruntime.NewWorker(workflowClient, mailboxWorkerSpec(cfg.workflowRuntime.TaskQueue, activities))
 	if err != nil {
 		log.Fatalf("failed to create mailbox workflow worker: %v", err)
@@ -85,6 +86,9 @@ func main() {
 	}
 	defer worker.Stop()
 
+	errCh := make(chan error, 2)
+	startWebhookServer(ctx, cfg.webhookHTTPAddr, mailboxStore, mailWatcher, errCh)
+
 	listener, err := net.Listen("tcp", cfg.listenAddr)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", cfg.listenAddr, err)
@@ -92,16 +96,31 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterMailboxServiceServer(grpcServer, &server{
-		emailClient:       pb.NewEmailServiceClient(emailConn),
+		emailBackend:      emailBackend,
 		operations:        operations,
 		workflowClient:    workflowClient,
 		workflowTaskQueue: cfg.workflowRuntime.TaskQueue,
-		cloudflareDomains: cfg.cloudflareDomains,
+		providers:         cfg.providers,
+		emailEvents:       emailEvents,
 	})
 
+	go func() {
+		<-ctx.Done()
+		grpcServer.GracefulStop()
+	}()
+
 	log.Printf("mailbox API listening on %s", cfg.listenAddr)
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("mailbox API failed: %v", err)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			errCh <- fmt.Errorf("mailbox API failed: %w", err)
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		stop()
+		log.Fatal(err)
 	}
 }
 
@@ -113,10 +132,9 @@ func loadConfig() config {
 	return config{
 		listenAddr:            envDefault("LISTEN_ADDR", ":50051"),
 		pgDSN:                 requiredEnv("MAILBOX_PG_DSN"),
-		emailAddr:             requiredEnv("MAILBOX_EMAIL_PROVIDER_ADDR"),
+		webhookHTTPAddr:       envDefault("MAILBOX_WEBHOOK_HTTP_ADDR", ":8082"),
 		browserAutomationAddr: envDefault("BROWSER_AUTOMATION_ADDR", "browser-automation:50051"),
-		cloudflareDomains:     parseDomainList(os.Getenv("MAILBOX_CLOUDFLARE_DOMAINS")),
-		outlookRegistration:   loadOutlookRegistrationConfig(),
+		providers:             loadMailboxProviderRuntimeConfig(),
 		workflowRuntime:       workflowRuntime,
 	}
 }
@@ -144,8 +162,18 @@ func newGRPCClient(name string, addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 }
 
+type emailBackend interface {
+	ListMailboxes(context.Context, *pb.ListEmailMailboxesRequest) (*pb.ListEmailMailboxesResponse, error)
+	UpsertMailbox(context.Context, *pb.UpsertEmailMailboxRequest) (*pb.UpsertEmailMailboxResponse, error)
+	DeleteMailbox(context.Context, *pb.DeleteMailboxRequest) (*pb.DeleteMailboxResponse, error)
+	WaitForEmail(context.Context, *pb.WaitForEmailRequest) (*pb.WaitForEmailResponse, error)
+	ListInbox(context.Context, *pb.ListMailboxInboxRequest) (*pb.ListMailboxInboxResponse, error)
+	FetchInboxes(context.Context, *pb.FetchInboxesRequest) (*pb.FetchInboxesResponse, error)
+	MarkEmailAuthStatus(context.Context, *pb.MarkEmailAuthStatusRequest) (*pb.MarkEmailAuthStatusResponse, error)
+}
+
 func (s *server) ListMailboxes(ctx context.Context, req *pb.ListEmailMailboxesRequest) (*pb.ListEmailMailboxesResponse, error) {
-	resp, err := s.emailClient.ListMailboxes(ctx, req)
+	resp, err := s.emailBackend.ListMailboxes(ctx, req)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "list mailboxes: %v", err)
 	}
@@ -161,15 +189,12 @@ func (s *server) UpsertMailbox(ctx context.Context, req *pb.UpsertEmailMailboxRe
 		return nil, status.Error(codes.InvalidArgument, "mailbox email_address is required")
 	}
 	mailbox.EmailAddress = normalizeEmail(mailbox.GetEmailAddress())
-	if mailbox.GetPrimaryEmail() == "" {
-		mailbox.PrimaryEmail = mailbox.GetEmailAddress()
-	}
 	if mailbox.GetProvider() == "" {
-		mailbox.Provider = "outlook"
+		mailbox.Provider = defaultMailboxProvider()
 	} else {
-		mailbox.Provider = normalizeEmailProviderString(mailbox.GetProvider())
+		mailbox.Provider = normalizeMailboxProviderInput(mailbox.GetProvider())
 	}
-	resp, err := s.emailClient.UpsertMailbox(ctx, req)
+	resp, err := s.emailBackend.UpsertMailbox(ctx, req)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "upsert mailbox: %v", err)
 	}
@@ -180,19 +205,15 @@ func (s *server) UpsertMailbox(ctx context.Context, req *pb.UpsertEmailMailboxRe
 }
 
 func (s *server) ListMailboxDomains(ctx context.Context, req *pb.ListMailboxDomainsRequest) (*pb.ListMailboxDomainsResponse, error) {
-	provider := req.GetProvider()
-	if provider != pb.MailboxProvider_MAILBOX_PROVIDER_UNSPECIFIED && provider != pb.MailboxProvider_MAILBOX_PROVIDER_CLOUDFLARE {
-		return &pb.ListMailboxDomainsResponse{Domains: []*pb.MailboxDomain{}}, nil
-	}
-	domains := make([]*pb.MailboxDomain, 0, len(s.cloudflareDomains))
-	for _, domain := range s.cloudflareDomains {
-		domains = append(domains, &pb.MailboxDomain{
-			Provider: pb.MailboxProvider_MAILBOX_PROVIDER_CLOUDFLARE,
-			Domain:   domain,
-			Enabled:  true,
-		})
-	}
-	return &pb.ListMailboxDomainsResponse{Domains: domains}, nil
+	return s.providers.ListDomains(req), nil
+}
+
+func (s *server) SyncMailboxDomains(ctx context.Context, req *pb.SyncMailboxDomainsRequest) (*pb.SyncMailboxDomainsResponse, error) {
+	return s.providers.SyncDomains(req), nil
+}
+
+func (s *server) ListMailboxProviderCapabilities(ctx context.Context, req *pb.ListMailboxProviderCapabilitiesRequest) (*pb.ListMailboxProviderCapabilitiesResponse, error) {
+	return s.providers.ListCapabilities(req), nil
 }
 
 func (s *server) DeleteMailbox(ctx context.Context, req *pb.DeleteMailboxRequest) (*pb.DeleteMailboxResponse, error) {
@@ -200,7 +221,7 @@ func (s *server) DeleteMailbox(ctx context.Context, req *pb.DeleteMailboxRequest
 	if email == "" {
 		return nil, status.Error(codes.InvalidArgument, "email_address is required")
 	}
-	resp, err := s.emailClient.DeleteMailbox(ctx, &pb.DeleteMailboxRequest{EmailAddress: email})
+	resp, err := s.emailBackend.DeleteMailbox(ctx, &pb.DeleteMailboxRequest{EmailAddress: email})
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "delete mailbox: %v", err)
 	}
@@ -215,11 +236,13 @@ func (s *server) WaitForMailboxEmail(ctx context.Context, req *pb.WaitForEmailRe
 	if email == "" {
 		return nil, status.Error(codes.InvalidArgument, "email_address is required")
 	}
-	resp, err := s.emailClient.WaitForEmail(ctx, &pb.WaitForEmailRequest{
+	resp, err := s.emailBackend.WaitForEmail(ctx, &pb.WaitForEmailRequest{
 		EmailAddress:    email,
 		SubjectKeyword:  strings.TrimSpace(req.GetSubjectKeyword()),
 		TimeoutSeconds:  req.GetTimeoutSeconds(),
 		IssuedAfterUnix: req.GetIssuedAfterUnix(),
+		ParserProfile:   req.GetParserProfile(),
+		SignalKind:      req.GetSignalKind(),
 	})
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "wait for mailbox email: %v", err)
@@ -295,6 +318,49 @@ func (s *server) startMailboxWorkflow(ctx context.Context, operationID string, w
 	return err
 }
 
+func (s *server) ListMailboxInbox(ctx context.Context, req *pb.ListMailboxInboxRequest) (*pb.ListMailboxInboxResponse, error) {
+	resp, err := s.emailBackend.ListInbox(ctx, req)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "list mailbox inbox: %v", err)
+	}
+	if resp == nil || resp.GetResult() == nil {
+		return nil, status.Error(codes.Internal, "email service returned empty inbox result")
+	}
+	return resp, nil
+}
+
+func (s *server) StreamMailboxEmailEvents(req *pb.StreamMailboxEmailEventsRequest, stream pb.MailboxService_StreamMailboxEmailEventsServer) error {
+	if s.emailEvents == nil {
+		return status.Error(codes.Unavailable, "mailbox email event stream is not configured")
+	}
+	email := normalizeEmail(req.GetEmailAddress())
+	if email == "" {
+		return status.Error(codes.InvalidArgument, "email_address is required")
+	}
+	events := s.emailEvents.Subscribe(stream.Context(), mailboxEmailEventFilter{
+		email:          email,
+		subjectKeyword: req.GetSubjectKeyword(),
+		parserProfile:  req.GetParserProfile(),
+		signalKind:     req.GetSignalKind(),
+	})
+	for {
+		select {
+		case <-stream.Context().Done():
+			return status.Error(codes.Canceled, "stream cancelled")
+		case message, ok := <-events:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(&pb.StreamMailboxEmailEventsResponse{
+				EmailAddress: email,
+				Message:      message,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (s *server) FetchMailboxInboxes(ctx context.Context, req *pb.FetchMailboxInboxesRequest) (*pb.FetchMailboxInboxesResponse, error) {
 	operationID := operationID("mailbox-inbox")
 	email := normalizeEmail(req.GetEmailAddress())
@@ -308,10 +374,12 @@ func (s *server) FetchMailboxInboxes(ctx context.Context, req *pb.FetchMailboxIn
 		return nil, status.Errorf(codes.Internal, "mark mailbox operation running: %v", err)
 	}
 
-	resp, err := s.emailClient.FetchInboxes(ctx, &pb.FetchInboxesRequest{
-		LimitPerMailbox: req.GetLimitPerMailbox(),
-		MaxMailboxes:    req.GetMaxMailboxes(),
-		EmailAddress:    email,
+	resp, err := s.emailBackend.FetchInboxes(ctx, &pb.FetchInboxesRequest{
+		LimitPerMailbox:   req.GetLimitPerMailbox(),
+		MaxMailboxes:      req.GetMaxMailboxes(),
+		EmailAddress:      email,
+		ParserProfile:     req.GetParserProfile(),
+		ReceivedAfterUnix: req.GetReceivedAfterUnix(),
 	})
 	if err != nil {
 		s.updateOperation(ctx, operationID, operationUpdate{
@@ -380,39 +448,6 @@ func (s *server) updateOperation(ctx context.Context, operationID string, update
 	if _, err := s.operations.update(ctx, operationID, update); err != nil {
 		log.Printf("update mailbox operation failed operation=%s: %v", operationID, err)
 	}
-}
-
-func normalizeEmail(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
-}
-
-func normalizeEmailProviderString(provider string) string {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "cf", "cloudflare", "cloudflare-email-relay":
-		return "cloudflare"
-	case "outlook", "microsoft", "graph":
-		return "outlook"
-	default:
-		return strings.ToLower(strings.TrimSpace(provider))
-	}
-}
-
-func parseDomainList(value string) []string {
-	raw := strings.NewReplacer(",", " ", "\n", " ", "\t", " ").Replace(value)
-	out := []string{}
-	seen := map[string]struct{}{}
-	for _, item := range strings.Fields(raw) {
-		domain := strings.Trim(strings.ToLower(strings.TrimSpace(item)), ".")
-		if domain == "" {
-			continue
-		}
-		if _, ok := seen[domain]; ok {
-			continue
-		}
-		seen[domain] = struct{}{}
-		out = append(out, domain)
-	}
-	return out
 }
 
 func normalizedLimit(limit int32) int32 {

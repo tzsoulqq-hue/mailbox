@@ -11,7 +11,7 @@
   },
   "upload_source_maps": true,
   "vars": {
-    "MAILBOX_WEBHOOK_URL": "https://hook.pood1e.space/webhooks/email/cloudflare",
+    "MAILBOX_WEBHOOK_URL": "https://hook.tibo-nice.space/webhooks/email/cloudflare",
     "WEBHOOK_FAIL_OPEN": "false"
   }
 }

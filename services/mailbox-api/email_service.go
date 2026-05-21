@@ -10,13 +10,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"outlookimapservice/pb"
+	"mailboxapi/pb"
 )
 
 type EmailService struct {
 	pb.UnimplementedEmailServiceServer
 	store     *MailboxStore
 	watcher   *MailWatcher
+	providers mailboxProviderRuntimeConfig
 	inboxOnce sync.Once
 	inboxGate chan struct{}
 }
@@ -82,6 +83,24 @@ func (s *EmailService) FetchInboxes(ctx context.Context, request *pb.FetchInboxe
 	targets := []inboxTarget{}
 	requestedEmail := normalizeEmail(request.GetEmailAddress())
 	if requestedEmail != "" {
+		if resultMailbox, ok := s.providers.StoredInboxOnlyMailbox(requestedEmail); ok {
+			if mailbox, err := s.store.FindMailbox(ctx, requestedEmail); err == nil {
+				resultMailbox = mailbox
+			}
+			messages, err := s.store.ListInboxMessagesSince(ctx, requestedEmail, request.GetLimitPerMailbox(), request.GetReceivedAfterUnix())
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+			return &pb.FetchInboxesResponse{
+				MailboxCount: int32(1),
+				FetchedCount: int32(1),
+				MessageCount: int32(len(messages)),
+				Results: []*pb.FetchMailboxInboxResult{{
+					Mailbox:  resultMailbox,
+					Messages: messages,
+				}},
+			}, nil
+		}
 		fetchMailbox, err := s.store.PollMailboxForEmail(ctx, requestedEmail)
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -92,7 +111,7 @@ func (s *EmailService) FetchInboxes(ctx context.Context, request *pb.FetchInboxe
 		}
 		targets = append(targets, inboxTarget{fetchMailbox: fetchMailbox, resultMailbox: resultMailbox})
 	} else {
-		mailboxes, err := s.store.ListOAuthPrimaryMailboxes(ctx, request.GetMaxMailboxes())
+		mailboxes, err := s.store.ListOAuthMailboxes(ctx, request.GetMaxMailboxes())
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
@@ -113,10 +132,10 @@ func (s *EmailService) FetchInboxes(ctx context.Context, request *pb.FetchInboxe
 		}
 
 		result := &pb.FetchMailboxInboxResult{Mailbox: target.resultMailbox}
-		messages, err := s.watcher.FetchMailboxInbox(ctx, target.fetchMailbox, request.GetLimitPerMailbox())
+		messages, err := s.watcher.FetchMailboxInbox(ctx, target.fetchMailbox, request.GetLimitPerMailbox(), request.GetReceivedAfterUnix())
 		if err != nil {
 			result.ErrorMessage = err.Error()
-			if cached, cacheErr := s.store.ListInboxMessages(ctx, target.fetchMailbox.GetEmailAddress(), request.GetLimitPerMailbox()); cacheErr == nil {
+			if cached, cacheErr := s.store.ListInboxMessagesSince(ctx, target.fetchMailbox.GetEmailAddress(), request.GetLimitPerMailbox(), request.GetReceivedAfterUnix()); cacheErr == nil {
 				result.Messages = cached
 				resp.MessageCount += int32(len(cached))
 			}
@@ -129,6 +148,37 @@ func (s *EmailService) FetchInboxes(ctx context.Context, request *pb.FetchInboxe
 		resp.Results = append(resp.Results, result)
 	}
 	return resp, nil
+}
+
+func (s *EmailService) ListInbox(ctx context.Context, request *pb.ListMailboxInboxRequest) (*pb.ListMailboxInboxResponse, error) {
+	email := normalizeEmail(request.GetEmailAddress())
+	if email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email_address is required")
+	}
+	limit := request.GetLimit()
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	messages, err := s.store.ListInboxMessages(ctx, email, limit)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	resultMailbox := &pb.EmailMailbox{
+		EmailAddress: email,
+		Provider:     s.providers.ProviderForInboxAddress(email, messages),
+		Domain:       domainForEmail(email),
+	}
+	prepareMailboxProjection(resultMailbox)
+	if mailbox, err := s.store.FindMailbox(ctx, email); err == nil {
+		resultMailbox = mailbox
+	}
+	return &pb.ListMailboxInboxResponse{Result: &pb.FetchMailboxInboxResult{
+		Mailbox:  resultMailbox,
+		Messages: messages,
+	}}, nil
 }
 
 func (s *EmailService) WaitForEmail(ctx context.Context, request *pb.WaitForEmailRequest) (*pb.WaitForEmailResponse, error) {
@@ -144,7 +194,7 @@ func (s *EmailService) WaitForEmail(ctx context.Context, request *pb.WaitForEmai
 	} else if ok {
 		return resp, nil
 	}
-	if s.isWebhookBackedAddress(email) {
+	if s.providers.IsStoredInboxOnlyAddress(email) {
 		return s.waitForPersistedEmail(ctx, request, timeoutSeconds, issuedAfterUnix)
 	}
 	if err := s.watcher.PollForEmail(ctx, email); err != nil {
@@ -215,21 +265,8 @@ func (s *EmailService) waitForPersistedEmail(ctx context.Context, request *pb.Wa
 	return &pb.WaitForEmailResponse{Found: false}, nil
 }
 
-func (s *EmailService) isWebhookBackedAddress(email string) bool {
-	_, domain, ok := strings.Cut(normalizeEmail(email), "@")
-	if !ok || domain == "" {
-		return false
-	}
-	for _, candidate := range configuredCloudflareDomains() {
-		if domain == candidate {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *EmailService) latestEmailResponse(ctx context.Context, request *pb.WaitForEmailRequest, issuedAfterUnix int64) (*pb.WaitForEmailResponse, bool, error) {
-	message, ok, err := s.store.LatestMessage(ctx, request.GetEmailAddress(), request.GetSubjectKeyword(), issuedAfterUnix)
+	message, ok, err := s.store.LatestMessageWithSignal(ctx, request.GetEmailAddress(), request.GetSubjectKeyword(), issuedAfterUnix, request.GetParserProfile(), request.GetSignalKind())
 	if err != nil || !ok {
 		return nil, false, err
 	}

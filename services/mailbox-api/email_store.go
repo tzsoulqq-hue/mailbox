@@ -7,20 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"outlookimapservice/pb"
+	"mailboxapi/pb"
 )
-
-const selectMailbox = `
-	SELECT id, email, provider, password, refresh_token, access_token, auth_status,
-		last_error, is_primary, primary_email, created_at, updated_at
-	FROM mailboxes
-`
 
 type mailboxRow struct {
 	ID           string
@@ -31,8 +26,6 @@ type mailboxRow struct {
 	AccessToken  string
 	AuthStatus   string
 	LastError    string
-	IsPrimary    bool
-	PrimaryEmail string
 	CreatedAt    int64
 	UpdatedAt    int64
 }
@@ -68,14 +61,24 @@ type inboxPersistMessage struct {
 	rawSize        int64
 }
 
+type inboxMessageKey struct {
+	provider     string
+	mailboxEmail string
+	messageKey   string
+}
+
 func (row inboxMessageRow) toProto() (*pb.EmailInboxMessage, error) {
+	return row.toProtoForProfile("")
+}
+
+func (row inboxMessageRow) toProtoForProfile(profile string) (*pb.EmailInboxMessage, error) {
 	recipients := []string{}
 	if strings.TrimSpace(row.RecipientsJSON) != "" {
 		if err := json.Unmarshal([]byte(row.RecipientsJSON), &recipients); err != nil {
 			return nil, err
 		}
 	}
-	return &pb.EmailInboxMessage{
+	return emailMessageWithSignals(&pb.EmailInboxMessage{
 		Id:                 row.ID,
 		MailboxEmail:       normalizeEmail(row.MailboxEmail),
 		Subject:            row.Subject,
@@ -88,7 +91,7 @@ func (row inboxMessageRow) toProto() (*pb.EmailInboxMessage, error) {
 		BodyText:           row.BodyText,
 		HtmlBody:           row.HTMLBody,
 		RawSize:            row.RawSize,
-	}, nil
+	}, profile), nil
 }
 
 type rowScanner interface {
@@ -96,11 +99,10 @@ type rowScanner interface {
 }
 
 type MailboxStore struct {
-	pool             *pgxpool.Pool
-	aliasTokenLength int
+	pool *pgxpool.Pool
 }
 
-func NewMailboxStore(ctx context.Context, dsn string, aliasTokenLength int) (*MailboxStore, error) {
+func NewMailboxStore(ctx context.Context, dsn string) (*MailboxStore, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("PG_DSN is required")
 	}
@@ -108,13 +110,7 @@ func NewMailboxStore(ctx context.Context, dsn string, aliasTokenLength int) (*Ma
 	if err != nil {
 		return nil, err
 	}
-	store := &MailboxStore{
-		pool:             pool,
-		aliasTokenLength: aliasTokenLength,
-	}
-	if store.aliasTokenLength <= 0 {
-		store.aliasTokenLength = defaultAliasTokenLength
-	}
+	store := &MailboxStore{pool: pool}
 	if err := store.ensureSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -133,38 +129,24 @@ func (s *MailboxStore) ensureSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS mailboxes (
 			id TEXT PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
-			provider TEXT NOT NULL DEFAULT 'outlook',
-			password TEXT NOT NULL DEFAULT '',
-			refresh_token TEXT NOT NULL DEFAULT '',
-			access_token TEXT NOT NULL DEFAULT '',
-			auth_status TEXT NOT NULL DEFAULT 'OAUTH_PENDING',
-			last_error TEXT NOT NULL DEFAULT '',
-			is_primary BOOLEAN NOT NULL DEFAULT false,
-			primary_email TEXT NOT NULL DEFAULT '',
+			provider TEXT NOT NULL DEFAULT '` + defaultMailboxProvider() + `',
 			created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-			updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+			updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+			last_inbox_received_at_ns BIGINT NOT NULL DEFAULT 0
 		)`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'outlook'`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS refresh_token TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS access_token TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auth_status TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailboxes ALTER COLUMN auth_status SET DEFAULT 'OAUTH_PENDING'`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT false`,
-		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS primary_email TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '` + defaultMailboxProvider() + `'`,
 		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT`,
 		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT`,
 		`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS last_inbox_received_at_ns BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS mailbox_inbox_seen (
-			provider TEXT NOT NULL DEFAULT 'outlook',
+			provider TEXT NOT NULL DEFAULT '` + defaultMailboxProvider() + `',
 			mailbox_email TEXT NOT NULL,
 			message_key TEXT NOT NULL,
 			seen_at BIGINT NOT NULL,
 			PRIMARY KEY (provider, mailbox_email, message_key)
 		)`,
 		`CREATE TABLE IF NOT EXISTS mailbox_inbox_messages (
-			provider TEXT NOT NULL DEFAULT 'outlook',
+			provider TEXT NOT NULL DEFAULT '` + defaultMailboxProvider() + `',
 			mailbox_email TEXT NOT NULL,
 			message_key TEXT NOT NULL,
 			message_id TEXT NOT NULL DEFAULT '',
@@ -181,8 +163,8 @@ func (s *MailboxStore) ensureSchema(ctx context.Context) error {
 			updated_at BIGINT NOT NULL,
 			PRIMARY KEY (provider, mailbox_email, message_key)
 		)`,
-		`ALTER TABLE mailbox_inbox_seen ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'outlook'`,
-		`ALTER TABLE mailbox_inbox_messages ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'outlook'`,
+		`ALTER TABLE mailbox_inbox_seen ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '` + defaultMailboxProvider() + `'`,
+		`ALTER TABLE mailbox_inbox_messages ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '` + defaultMailboxProvider() + `'`,
 		`ALTER TABLE mailbox_inbox_messages ADD COLUMN IF NOT EXISTS body_text TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE mailbox_inbox_messages ADD COLUMN IF NOT EXISTS html_body TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE mailbox_inbox_messages ADD COLUMN IF NOT EXISTS raw_size BIGINT NOT NULL DEFAULT 0`,
@@ -216,47 +198,46 @@ func (s *MailboxStore) ensureSchema(ctx context.Context) error {
 		`ALTER TABLE mailbox_inbox_messages ADD PRIMARY KEY (provider, mailbox_email, message_key)`,
 		`DROP INDEX IF EXISTS idx_mailboxes_assigned_account`,
 		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS assigned_account_id`,
-		`DO $$
-		BEGIN
-			IF EXISTS (
-				SELECT 1
-				FROM information_schema.columns
-				WHERE table_name = 'mailboxes'
-				  AND column_name = 'status'
-			) THEN
-				UPDATE mailboxes
-				SET auth_status = CASE
-					WHEN status IN ('OAUTH_PENDING', 'AUTH_FAILED', 'NEEDS_MANUAL_VERIFICATION') THEN status
-					WHEN refresh_token <> '' THEN 'AUTHORIZED'
-					ELSE 'OAUTH_PENDING'
-				END
-				WHERE auth_status = '';
-			END IF;
-		END $$`,
-		`UPDATE mailboxes
-				SET auth_status = CASE
-					WHEN refresh_token <> '' THEN 'AUTHORIZED'
-					ELSE 'OAUTH_PENDING'
-				END
-				WHERE auth_status = ''`,
-		`UPDATE mailboxes SET auth_status = 'OAUTH_PENDING', last_error = ''
-					WHERE auth_status = 'AUTH_FAILED'
-					AND last_error = 'registered mailbox has no OAuth refresh token'`,
 		`DROP INDEX IF EXISTS idx_mailboxes_status`,
+		`DROP INDEX IF EXISTS idx_mailboxes_primary`,
+		`DROP INDEX IF EXISTS idx_mailboxes_auth_status`,
 		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS status`,
-		`CREATE INDEX IF NOT EXISTS idx_mailboxes_auth_status ON mailboxes(auth_status)`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS is_primary`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS primary_email`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS password`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS refresh_token`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS access_token`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS auth_status`,
+		`ALTER TABLE mailboxes DROP COLUMN IF EXISTS last_error`,
 		`CREATE INDEX IF NOT EXISTS idx_mailboxes_provider ON mailboxes(provider)`,
-		`CREATE INDEX IF NOT EXISTS idx_mailboxes_primary ON mailboxes(primary_email)`,
 		`CREATE INDEX IF NOT EXISTS idx_mailbox_inbox_seen_at ON mailbox_inbox_seen(seen_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_mailbox_inbox_messages_received_at ON mailbox_inbox_messages(mailbox_email, received_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_mailbox_inbox_messages_provider_received_at ON mailbox_inbox_messages(provider, mailbox_email, received_at DESC)`,
 	}
+	statements = insertSchemaStatementsAfter(statements, "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS last_inbox_received_at_ns", mailboxProviderSchemaStatements())
+	statements = insertSchemaStatementsAfter(statements, "ALTER TABLE mailboxes DROP COLUMN IF EXISTS assigned_account_id", mailboxProviderLegacyStatements())
 	for _, statement := range statements {
 		if _, err := s.pool.Exec(ctx, statement); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func insertSchemaStatementsAfter(statements []string, prefix string, additions []string) []string {
+	if len(additions) == 0 {
+		return statements
+	}
+	for i, statement := range statements {
+		if strings.HasPrefix(strings.TrimSpace(statement), prefix) {
+			out := make([]string, 0, len(statements)+len(additions))
+			out = append(out, statements[:i+1]...)
+			out = append(out, additions...)
+			out = append(out, statements[i+1:]...)
+			return out
+		}
+	}
+	return append(statements, additions...)
 }
 
 func (s *MailboxStore) UpsertMailbox(ctx context.Context, mailbox *pb.EmailMailbox) (*pb.EmailMailbox, error) {
@@ -270,68 +251,35 @@ func (s *MailboxStore) UpsertMailbox(ctx context.Context, mailbox *pb.EmailMailb
 	requestedProvider := normalizeEmailProvider(mailbox.GetProvider())
 	insertProvider := requestedProvider
 	if insertProvider == "" {
-		insertProvider = emailProviderOutlook
+		insertProvider = defaultMailboxProvider()
 	}
-	isPrimary := mailbox.GetIsPrimary()
-	primaryEmail := normalizeEmail(mailbox.GetPrimaryEmail())
-	if primaryEmail == "" {
-		if isPrimary {
-			primaryEmail = email
-		} else {
-			primaryEmail = canonicalEmail(email)
-		}
-	}
-	if primaryEmail == email {
-		isPrimary = true
-	}
-	requestedAuthStatus := strings.TrimSpace(mailbox.GetAuthStatus())
-	insertAuthStatus := requestedAuthStatus
-	if insertAuthStatus == "" {
-		insertAuthStatus = authStatusOAuthPending
-		if strings.TrimSpace(mailbox.GetRefreshToken()) != "" {
-			insertAuthStatus = authStatusAuthorized
-		}
-	}
-	refreshToken := strings.TrimSpace(mailbox.GetRefreshToken())
-	accessToken := strings.TrimSpace(mailbox.GetAccessToken())
-	lastError := strings.TrimSpace(mailbox.GetLastError())
 	rowID, err := randomHex(16)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().Unix()
 
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO mailboxes (
-			id, email, provider, password, refresh_token, access_token, auth_status,
-			last_error, is_primary, primary_email, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		ON CONFLICT (email) DO UPDATE SET
-			provider = CASE WHEN $13 <> '' THEN EXCLUDED.provider ELSE mailboxes.provider END,
-			password = CASE WHEN EXCLUDED.password <> '' THEN EXCLUDED.password ELSE mailboxes.password END,
-			refresh_token = CASE WHEN EXCLUDED.refresh_token <> '' THEN EXCLUDED.refresh_token ELSE mailboxes.refresh_token END,
-			access_token = CASE WHEN EXCLUDED.access_token <> '' THEN EXCLUDED.access_token ELSE mailboxes.access_token END,
-			auth_status = CASE WHEN $14 <> '' THEN EXCLUDED.auth_status WHEN EXCLUDED.refresh_token <> '' THEN 'AUTHORIZED' ELSE mailboxes.auth_status END,
-			last_error = CASE WHEN $14 <> '' OR EXCLUDED.last_error <> '' THEN EXCLUDED.last_error ELSE mailboxes.last_error END,
-			is_primary = EXCLUDED.is_primary,
-			primary_email = EXCLUDED.primary_email,
-			updated_at = EXCLUDED.updated_at
-	`, rowID, email, insertProvider, mailbox.GetPassword(), refreshToken, accessToken, insertAuthStatus, lastError, isPrimary, primaryEmail, now, now, requestedProvider, requestedAuthStatus)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, err
 	}
-	if isPrimary && (refreshToken != "" || accessToken != "" || requestedAuthStatus != "") {
-		if _, err := s.pool.Exec(ctx, `
-			UPDATE mailboxes
-			SET refresh_token = CASE WHEN $1 <> '' THEN $1 ELSE refresh_token END,
-				access_token = CASE WHEN $2 <> '' THEN $2 ELSE access_token END,
-				auth_status = CASE WHEN $3 <> '' THEN $3 ELSE auth_status END,
-				last_error = CASE WHEN $3 <> '' OR $4 <> '' THEN $4 ELSE last_error END,
-				updated_at = $5
-			WHERE primary_email = $6 AND is_primary = false
-		`, refreshToken, accessToken, requestedAuthStatus, lastError, now, email); err != nil {
-			return nil, err
-		}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var persistedProvider string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO mailboxes (id, email, provider, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$4)
+		ON CONFLICT (email) DO UPDATE SET
+			provider = CASE WHEN $5 <> '' THEN EXCLUDED.provider ELSE mailboxes.provider END,
+			updated_at = EXCLUDED.updated_at
+		RETURNING provider
+	`, rowID, email, insertProvider, now, requestedProvider).Scan(&persistedProvider); err != nil {
+		return nil, err
+	}
+	if err := mailboxProviderUpsert(ctx, tx, persistedProvider, mailbox, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return s.FindMailbox(ctx, email)
 }
@@ -344,18 +292,39 @@ func (s *MailboxStore) ListMailboxes(ctx context.Context, authStatus string, pro
 	if n > 500 {
 		n = 500
 	}
+	stored, err := s.listStoredMailboxes(ctx, authStatus, provider, n)
+	if err != nil {
+		return nil, err
+	}
+	out := stored
+	virtual, err := listMailboxProviderVirtualMailboxes(ctx, s.pool, strings.TrimSpace(authStatus), normalizeEmailProvider(provider), n)
+	if err != nil {
+		return nil, err
+	}
+	if len(virtual) > 0 {
+		out = append(out, virtual...)
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].GetUpdatedAt() > out[j].GetUpdatedAt()
+		})
+		if len(out) > n {
+			out = out[:n]
+		}
+	}
+	return out, nil
+}
+
+func (s *MailboxStore) listStoredMailboxes(ctx context.Context, authStatus string, provider string, limit int) ([]*pb.EmailMailbox, error) {
 	args := []any{}
-	query := selectMailbox + " WHERE 1=1"
+	query := mailboxSelectSQL() + ` WHERE 1=1`
 	if trimmed := strings.TrimSpace(authStatus); trimmed != "" {
-		args = append(args, trimmed)
-		query += fmt.Sprintf(" AND auth_status = $%d", len(args))
+		query += " AND " + mailboxProviderAuthFilter(normalizeEmailProvider(provider), trimmed, &args)
 	}
 	if trimmed := normalizeEmailProvider(provider); trimmed != "" {
 		args = append(args, trimmed)
-		query += fmt.Sprintf(" AND provider = $%d", len(args))
+		query += fmt.Sprintf(" AND m.provider = $%d", len(args))
 	}
-	args = append(args, n)
-	query += fmt.Sprintf(" ORDER BY is_primary DESC, updated_at DESC LIMIT $%d", len(args))
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY m.updated_at DESC LIMIT $%d", len(args))
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -377,7 +346,7 @@ func (s *MailboxStore) ListMailboxes(ctx context.Context, authStatus string, pro
 	return out, nil
 }
 
-func (s *MailboxStore) ListOAuthPrimaryMailboxes(ctx context.Context, limit int32) ([]*pb.EmailMailbox, error) {
+func (s *MailboxStore) ListOAuthMailboxes(ctx context.Context, limit int32) ([]*pb.EmailMailbox, error) {
 	n := int(limit)
 	if n <= 0 {
 		n = 100
@@ -385,14 +354,11 @@ func (s *MailboxStore) ListOAuthPrimaryMailboxes(ctx context.Context, limit int3
 	if n > 500 {
 		n = 500
 	}
-	rows, err := s.pool.Query(ctx, selectMailbox+`
-			WHERE is_primary = true
-			AND provider = $1
-			AND refresh_token <> ''
-			AND auth_status = $2
-			ORDER BY updated_at DESC
-			LIMIT $3
-		`, emailProviderOutlook, authStatusAuthorized, n)
+	args := []any{}
+	query := mailboxSelectSQL() + " WHERE " + mailboxProviderAuthFilter("", authStatusAuthorized, &args)
+	args = append(args, n)
+	query += fmt.Sprintf(" ORDER BY m.updated_at DESC LIMIT $%d", len(args))
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -403,6 +369,9 @@ func (s *MailboxStore) ListOAuthPrimaryMailboxes(ctx context.Context, limit int3
 		row, err := scanMailbox(rows)
 		if err != nil {
 			return nil, err
+		}
+		if mailboxProviderValidatePoll(row) != nil {
+			continue
 		}
 		out = append(out, row.toProto())
 	}
@@ -436,87 +405,17 @@ func (s *MailboxStore) HasInboxMessages(ctx context.Context, email string) (bool
 	return exists, err
 }
 
-func (s *MailboxStore) RecordInboxMessages(ctx context.Context, email string, messages []graphMessage) ([]graphMessage, error) {
-	email = normalizeEmail(email)
-	if email == "" {
-		return nil, errors.New("email_address is required")
-	}
-	if len(messages) == 0 {
-		return []graphMessage{}, nil
-	}
-
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	now := time.Now().Unix()
-	unseen := make([]graphMessage, 0, len(messages))
-	var maxReceivedAtNs int64
-	for _, msg := range messages {
-		receivedAtNs := parseGraphTimeUnixNano(msg.ReceivedDateTime)
-		if receivedAtNs > maxReceivedAtNs {
-			maxReceivedAtNs = receivedAtNs
-		}
-		inboxMsg := inboxMessage(email, msg)
-		key := stableMessageKey(emailProviderOutlook, email, messageKey(msg))
-		if err := insertInboxMessage(ctx, tx, inboxPersistMessage{
-			key:            key,
-			id:             inboxMsg.GetId(),
-			mailboxEmail:   email,
-			subject:        inboxMsg.GetSubject(),
-			fromAddress:    inboxMsg.GetFromAddress(),
-			bodyPreview:    inboxMsg.GetBodyPreview(),
-			receivedAtUnix: inboxMsg.GetReceivedAtUnix(),
-			recipients:     inboxMsg.GetRecipients(),
-			provider:       emailProviderOutlook,
-			sourceEmail:    email,
-			bodyText:       inboxMsg.GetBodyText(),
-			htmlBody:       inboxMsg.GetHtmlBody(),
-			rawSize:        inboxMsg.GetRawSize(),
-		}, now); err != nil {
-			return nil, err
-		}
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO mailbox_inbox_seen (provider, mailbox_email, message_key, seen_at)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (provider, mailbox_email, message_key) DO NOTHING
-		`, emailProviderOutlook, email, key, now)
-		if err != nil {
-			return nil, err
-		}
-		if tag.RowsAffected() > 0 {
-			unseen = append(unseen, msg)
-		}
-	}
-	if maxReceivedAtNs > 0 {
-		if _, err := tx.Exec(ctx, `
-			UPDATE mailboxes
-			SET last_inbox_received_at_ns = GREATEST(last_inbox_received_at_ns, $1),
-				updated_at = $2
-			WHERE email = $3
-		`, maxReceivedAtNs, now, email); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return unseen, nil
-}
-
-func (s *MailboxStore) RecordInboundEmail(ctx context.Context, event *pb.InboundEmailWebhook) error {
+func (s *MailboxStore) RecordInboundEmail(ctx context.Context, event *pb.InboundEmailWebhook) ([]*pb.EmailInboxMessage, error) {
 	if event == nil {
-		return errors.New("email event is required")
+		return nil, errors.New("email event is required")
 	}
 	provider := normalizeEmailProvider(event.GetProvider())
 	if provider == "" {
-		return errors.New("email event provider is required")
+		return nil, errors.New("email event provider is required")
 	}
 	recipients := uniqueStrings(event.GetRecipients())
 	if len(recipients) == 0 {
-		return errors.New("email event recipients are required")
+		return nil, errors.New("email event recipients are required")
 	}
 	receivedAt := event.GetReceivedAtUnix()
 	if receivedAt <= 0 {
@@ -529,14 +428,35 @@ func (s *MailboxStore) RecordInboundEmail(ctx context.Context, event *pb.Inbound
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	now := time.Now().Unix()
+	touchedMailboxes := map[string]struct{}{}
+	touchedDomains := map[string]struct{}{}
+	unseen := make([]*pb.EmailInboxMessage, 0, len(recipients))
 	for _, recipient := range recipients {
+		touchedMailboxes[recipient] = struct{}{}
+		if domain := domainForEmail(recipient); domain != "" {
+			touchedDomains[domain] = struct{}{}
+		}
 		key := stableMessageKey(provider, recipient, firstNonEmpty(event.GetEventId(), event.GetMessageId(), event.GetSubject()))
 		messageID := firstNonEmpty(event.GetMessageId(), event.GetEventId(), key)
+		persisted := &pb.EmailInboxMessage{
+			Id:                 messageID,
+			MailboxEmail:       recipient,
+			Subject:            strings.TrimSpace(event.GetSubject()),
+			FromAddress:        normalizeEmail(event.GetFromAddress()),
+			BodyPreview:        compactMessageText(body, 500),
+			ReceivedAtUnix:     receivedAt,
+			Recipients:         recipients,
+			Provider:           provider,
+			SourceMailboxEmail: recipient,
+			BodyText:           body,
+			HtmlBody:           strings.TrimSpace(event.GetHtmlBody()),
+			RawSize:            event.GetRawSize(),
+		}
 		if err := insertInboxMessage(ctx, tx, inboxPersistMessage{
 			key:            key,
 			id:             messageID,
@@ -552,17 +472,30 @@ func (s *MailboxStore) RecordInboundEmail(ctx context.Context, event *pb.Inbound
 			htmlBody:       strings.TrimSpace(event.GetHtmlBody()),
 			rawSize:        event.GetRawSize(),
 		}, now); err != nil {
-			return err
+			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO mailbox_inbox_seen (provider, mailbox_email, message_key, seen_at)
 			VALUES ($1, $2, $3, $4)
 			ON CONFLICT (provider, mailbox_email, message_key) DO NOTHING
-		`, provider, recipient, key, now); err != nil {
-			return err
+		`, provider, recipient, key, now)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() > 0 {
+			unseen = append(unseen, emailMessageWithSignals(persisted, ""))
 		}
 	}
-	return tx.Commit(ctx)
+	if err := mailboxProviderPruneInbound(ctx, tx, provider, mailboxInboxRetention{
+		touchedMailboxes: touchedMailboxes,
+		touchedDomains:   touchedDomains,
+	}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return unseen, nil
 }
 
 func insertInboxMessage(ctx context.Context, tx pgx.Tx, msg inboxPersistMessage, now int64) error {
@@ -597,21 +530,131 @@ func insertInboxMessage(ctx context.Context, tx pgx.Tx, msg inboxPersistMessage,
 	return err
 }
 
+func pruneMailboxMessages(ctx context.Context, tx pgx.Tx, provider string, mailboxEmail string, limit int) error {
+	provider = normalizeEmailProvider(provider)
+	mailboxEmail = normalizeEmail(mailboxEmail)
+	if provider == "" || mailboxEmail == "" || limit <= 0 {
+		return nil
+	}
+	keys, err := expiredInboxKeys(ctx, tx, `
+		SELECT provider, mailbox_email, message_key
+		FROM mailbox_inbox_messages
+		WHERE provider = $1 AND mailbox_email = $2
+		ORDER BY received_at DESC, updated_at DESC, message_key DESC
+		OFFSET $3
+	`, provider, mailboxEmail, limit)
+	if err != nil {
+		return err
+	}
+	return deleteInboxKeys(ctx, tx, keys)
+}
+
+func pruneDomainMessages(ctx context.Context, tx pgx.Tx, provider string, domain string, limit int) error {
+	provider = normalizeEmailProvider(provider)
+	domain = strings.Trim(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if provider == "" || domain == "" || limit <= 0 {
+		return nil
+	}
+	keys, err := expiredInboxKeys(ctx, tx, `
+		SELECT provider, mailbox_email, message_key
+		FROM mailbox_inbox_messages
+		WHERE provider = $1 AND split_part(mailbox_email, '@', 2) = $2
+		ORDER BY received_at DESC, updated_at DESC, message_key DESC
+		OFFSET $3
+	`, provider, domain, limit)
+	if err != nil {
+		return err
+	}
+	return deleteInboxKeys(ctx, tx, keys)
+}
+
+func expiredInboxKeys(ctx context.Context, tx pgx.Tx, query string, args ...any) ([]inboxMessageKey, error) {
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	keys := []inboxMessageKey{}
+	for rows.Next() {
+		var key inboxMessageKey
+		if err := rows.Scan(&key.provider, &key.mailboxEmail, &key.messageKey); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+func deleteInboxKeys(ctx context.Context, tx pgx.Tx, keys []inboxMessageKey) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	providers := make([]string, 0, len(keys))
+	mailboxEmails := make([]string, 0, len(keys))
+	messageKeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		providers = append(providers, key.provider)
+		mailboxEmails = append(mailboxEmails, key.mailboxEmail)
+		messageKeys = append(messageKeys, key.messageKey)
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM mailbox_inbox_messages msg
+		USING unnest($1::text[], $2::text[], $3::text[]) expired(provider, mailbox_email, message_key)
+		WHERE msg.provider = expired.provider
+		  AND msg.mailbox_email = expired.mailbox_email
+		  AND msg.message_key = expired.message_key
+	`, providers, mailboxEmails, messageKeys); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		DELETE FROM mailbox_inbox_seen seen
+		USING unnest($1::text[], $2::text[], $3::text[]) expired(provider, mailbox_email, message_key)
+		WHERE seen.provider = expired.provider
+		  AND seen.mailbox_email = expired.mailbox_email
+		  AND seen.message_key = expired.message_key
+	`, providers, mailboxEmails, messageKeys)
+	return err
+}
+
+func messageMailboxEmails(accountEmail string, recipients []string) []string {
+	items := []string{normalizeEmail(accountEmail)}
+	for _, recipient := range recipients {
+		if email := normalizeEmail(recipient); email != "" {
+			items = append(items, email)
+		}
+	}
+	return uniqueStrings(items)
+}
+
 func (s *MailboxStore) ListInboxMessages(ctx context.Context, email string, limit int32) ([]*pb.EmailInboxMessage, error) {
+	return s.ListInboxMessagesSince(ctx, email, limit, 0)
+}
+
+func (s *MailboxStore) ListInboxMessagesSince(ctx context.Context, email string, limit int32, receivedAfterUnix int64) ([]*pb.EmailInboxMessage, error) {
 	email = normalizeEmail(email)
 	if email == "" {
 		return nil, errors.New("email_address is required")
 	}
 	n := messageLimitValue(limit, defaultMessageLimit)
-	rows, err := s.pool.Query(ctx, `
+	args := []any{email}
+	query := `
 		SELECT message_id, mailbox_email, subject, from_address, body_preview,
 			received_at, recipients_json, provider, source_mailbox_email, body_text,
 			html_body, raw_size
 		FROM mailbox_inbox_messages
 		WHERE mailbox_email = $1
+	`
+	if receivedAfterUnix > 0 {
+		args = append(args, receivedAfterUnix)
+		query += fmt.Sprintf(" AND received_at > $%d", len(args))
+	}
+	args = append(args, n)
+	query += fmt.Sprintf(`
 		ORDER BY received_at DESC, updated_at DESC, message_key DESC
-		LIMIT $2
-	`, email, n)
+		LIMIT $%d
+	`, len(args))
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -640,7 +683,7 @@ func (s *MailboxStore) ListInboxMessages(ctx context.Context, email string, limi
 		if err := json.Unmarshal([]byte(row.RecipientsJSON), &recipients); err != nil {
 			recipients = []string{}
 		}
-		out = append(out, &pb.EmailInboxMessage{
+		out = append(out, emailMessageWithSignals(&pb.EmailInboxMessage{
 			Id:                 row.ID,
 			MailboxEmail:       normalizeEmail(row.MailboxEmail),
 			Subject:            row.Subject,
@@ -653,14 +696,18 @@ func (s *MailboxStore) ListInboxMessages(ctx context.Context, email string, limi
 			BodyText:           row.BodyText,
 			HtmlBody:           row.HTMLBody,
 			RawSize:            row.RawSize,
-		})
+		}, ""))
 	}
 	return out, rows.Err()
 }
 
 func (s *MailboxStore) LatestMessage(ctx context.Context, email string, subjectKeyword string, issuedAfterUnix int64) (*pb.EmailInboxMessage, bool, error) {
+	return s.LatestMessageWithSignal(ctx, email, subjectKeyword, issuedAfterUnix, "", pb.EmailSignalKind_EMAIL_SIGNAL_KIND_UNSPECIFIED)
+}
+
+func (s *MailboxStore) LatestMessageWithSignal(ctx context.Context, email string, subjectKeyword string, issuedAfterUnix int64, parserProfile string, signalKind pb.EmailSignalKind) (*pb.EmailInboxMessage, bool, error) {
 	for _, candidate := range uniqueStrings([]string{email, canonicalEmail(email)}) {
-		msg, ok, err := s.latestMessageForMailbox(ctx, candidate, subjectKeyword, issuedAfterUnix)
+		msg, ok, err := s.latestMessageForMailbox(ctx, candidate, subjectKeyword, issuedAfterUnix, parserProfile, signalKind)
 		if err != nil || ok {
 			return msg, ok, err
 		}
@@ -668,7 +715,7 @@ func (s *MailboxStore) LatestMessage(ctx context.Context, email string, subjectK
 	return nil, false, nil
 }
 
-func (s *MailboxStore) latestMessageForMailbox(ctx context.Context, email string, subjectKeyword string, issuedAfterUnix int64) (*pb.EmailInboxMessage, bool, error) {
+func (s *MailboxStore) latestMessageForMailbox(ctx context.Context, email string, subjectKeyword string, issuedAfterUnix int64, parserProfile string, signalKind pb.EmailSignalKind) (*pb.EmailInboxMessage, bool, error) {
 	email = normalizeEmail(email)
 	if email == "" {
 		return nil, false, nil
@@ -689,34 +736,42 @@ func (s *MailboxStore) latestMessageForMailbox(ctx context.Context, email string
 		args = append(args, "%"+keyword+"%")
 		query += fmt.Sprintf(" AND (subject ILIKE $%d OR body_preview ILIKE $%d OR body_text ILIKE $%d)", len(args), len(args), len(args))
 	}
-	query += " ORDER BY received_at DESC, updated_at DESC, message_key DESC LIMIT 1"
+	args = append(args, 50)
+	query += fmt.Sprintf(" ORDER BY received_at DESC, updated_at DESC, message_key DESC LIMIT $%d", len(args))
 
-	var row inboxMessageRow
-	err := s.pool.QueryRow(ctx, query, args...).Scan(
-		&row.ID,
-		&row.MailboxEmail,
-		&row.Subject,
-		&row.FromAddress,
-		&row.BodyPreview,
-		&row.ReceivedAtUnix,
-		&row.RecipientsJSON,
-		&row.Provider,
-		&row.SourceEmail,
-		&row.BodyText,
-		&row.HTMLBody,
-		&row.RawSize,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
-	}
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
 	}
-	msg, err := row.toProto()
-	if err != nil {
-		return nil, false, err
+	defer rows.Close()
+
+	for rows.Next() {
+		var row inboxMessageRow
+		if err := rows.Scan(
+			&row.ID,
+			&row.MailboxEmail,
+			&row.Subject,
+			&row.FromAddress,
+			&row.BodyPreview,
+			&row.ReceivedAtUnix,
+			&row.RecipientsJSON,
+			&row.Provider,
+			&row.SourceEmail,
+			&row.BodyText,
+			&row.HTMLBody,
+			&row.RawSize,
+		); err != nil {
+			return nil, false, err
+		}
+		msg, err := row.toProtoForProfile(parserProfile)
+		if err != nil {
+			return nil, false, err
+		}
+		if messageHasSignal(msg, signalKind) {
+			return msg, true, nil
+		}
 	}
-	return msg, true, nil
+	return nil, false, rows.Err()
 }
 
 func (s *MailboxStore) MarkEmailAuthStatus(ctx context.Context, email string, authStatus string, lastError string) (*pb.EmailMailbox, error) {
@@ -734,7 +789,7 @@ func (s *MailboxStore) MarkEmailAuthStatus(ctx context.Context, email string, au
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	row, err := scanMailbox(tx.QueryRow(ctx, selectMailbox+" WHERE email = $1 FOR UPDATE", email))
+	row, err := scanMailbox(tx.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1 FOR UPDATE", email))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("mailbox not found: %s", redactEmail(email))
 	}
@@ -742,13 +797,11 @@ func (s *MailboxStore) MarkEmailAuthStatus(ctx context.Context, email string, au
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if _, err := tx.Exec(ctx, "UPDATE mailboxes SET auth_status = $1, last_error = $2, updated_at = $3 WHERE email = $4", authStatus, strings.TrimSpace(lastError), now, email); err != nil {
+	if err := mailboxProviderUpdateAuth(ctx, tx, row.Provider, email, authStatus, lastError, now); err != nil {
 		return nil, err
 	}
-	if row.IsPrimary {
-		if _, err := tx.Exec(ctx, "UPDATE mailboxes SET auth_status = $1, last_error = $2, updated_at = $3 WHERE primary_email = $4 AND is_primary = false", authStatus, strings.TrimSpace(lastError), now, row.Email); err != nil {
-			return nil, err
-		}
+	if _, err := tx.Exec(ctx, "UPDATE mailboxes SET updated_at = $1 WHERE email = $2", now, email); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -767,48 +820,26 @@ func (s *MailboxStore) DeleteMailbox(ctx context.Context, email string) (bool, e
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	row, err := scanMailbox(tx.QueryRow(ctx, selectMailbox+" WHERE email = $1 FOR UPDATE", email))
+	row, err := scanMailbox(tx.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1 FOR UPDATE", email))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		deleted, deleteErr := deleteMailboxInbox(ctx, tx, []string{email})
+		if deleteErr != nil {
+			return false, deleteErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return deleted, nil
 	}
 	if err != nil {
 		return false, err
 	}
 
 	deleteEmails := []string{row.Email}
-	if row.IsPrimary {
-		rows, err := tx.Query(ctx, "SELECT email FROM mailboxes WHERE primary_email = $1 AND email <> $1 FOR UPDATE", row.Email)
-		if err != nil {
-			return false, err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var alias string
-			if err := rows.Scan(&alias); err != nil {
-				return false, err
-			}
-			if normalized := normalizeEmail(alias); normalized != "" {
-				deleteEmails = append(deleteEmails, normalized)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return false, err
-		}
-	}
-
-	args := make([]any, 0, len(deleteEmails))
-	placeholders := make([]string, 0, len(deleteEmails))
-	for _, item := range deleteEmails {
-		args = append(args, item)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
-	}
-	inClause := strings.Join(placeholders, ",")
-	if _, err := tx.Exec(ctx, "DELETE FROM mailbox_inbox_messages WHERE mailbox_email IN ("+inClause+")", args...); err != nil {
+	if _, err := deleteMailboxInbox(ctx, tx, deleteEmails); err != nil {
 		return false, err
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM mailbox_inbox_seen WHERE mailbox_email IN ("+inClause+")", args...); err != nil {
-		return false, err
-	}
+	args, inClause := sqlInArgs(deleteEmails)
 	tag, err := tx.Exec(ctx, "DELETE FROM mailboxes WHERE email IN ("+inClause+")", args...)
 	if err != nil {
 		return false, err
@@ -819,8 +850,31 @@ func (s *MailboxStore) DeleteMailbox(ctx context.Context, email string) (bool, e
 	return tag.RowsAffected() > 0, nil
 }
 
+func deleteMailboxInbox(ctx context.Context, tx pgx.Tx, emails []string) (bool, error) {
+	args, inClause := sqlInArgs(emails)
+	messageTag, err := tx.Exec(ctx, "DELETE FROM mailbox_inbox_messages WHERE mailbox_email IN ("+inClause+")", args...)
+	if err != nil {
+		return false, err
+	}
+	seenTag, err := tx.Exec(ctx, "DELETE FROM mailbox_inbox_seen WHERE mailbox_email IN ("+inClause+")", args...)
+	if err != nil {
+		return false, err
+	}
+	return messageTag.RowsAffected() > 0 || seenTag.RowsAffected() > 0, nil
+}
+
+func sqlInArgs(values []string) ([]any, string) {
+	args := make([]any, 0, len(values))
+	placeholders := make([]string, 0, len(values))
+	for _, item := range values {
+		args = append(args, item)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+	}
+	return args, strings.Join(placeholders, ",")
+}
+
 func (s *MailboxStore) FindMailbox(ctx context.Context, email string) (*pb.EmailMailbox, error) {
-	row, err := scanMailbox(s.pool.QueryRow(ctx, selectMailbox+" WHERE email = $1", normalizeEmail(email)))
+	row, err := scanMailbox(s.pool.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1", normalizeEmail(email)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("mailbox not found: %s", redactEmail(email))
 	}
@@ -833,11 +887,11 @@ func (s *MailboxStore) FindMailbox(ctx context.Context, email string) (*pb.Email
 
 func (s *MailboxStore) PollMailboxForEmail(ctx context.Context, email string) (*pb.EmailMailbox, error) {
 	email = normalizeEmail(email)
-	row, err := scanMailbox(s.pool.QueryRow(ctx, selectMailbox+" WHERE email = $1", email))
+	row, err := scanMailbox(s.pool.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1", email))
 	if errors.Is(err, pgx.ErrNoRows) {
 		canonical := canonicalEmail(email)
 		if canonical != "" && canonical != email {
-			row, err = scanMailbox(s.pool.QueryRow(ctx, selectMailbox+" WHERE email = $1 AND is_primary = true", canonical))
+			row, err = scanMailbox(s.pool.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1", canonical))
 		}
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -847,32 +901,22 @@ func (s *MailboxStore) PollMailboxForEmail(ctx context.Context, email string) (*
 		return nil, err
 	}
 
-	primaryEmail := row.Email
-	if !row.IsPrimary {
-		primaryEmail = row.PrimaryEmail
-		if primaryEmail == "" {
-			primaryEmail = canonicalEmail(row.Email)
-		}
-	}
-	primary, err := scanMailbox(s.pool.QueryRow(ctx, selectMailbox+" WHERE email = $1 AND is_primary = true", primaryEmail))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("primary mailbox not found for %s", redactEmail(email))
-	}
-	if err != nil {
+	if err := mailboxProviderValidatePoll(row); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(primary.RefreshToken) == "" {
-		return nil, fmt.Errorf("primary mailbox has no refresh token: %s", redactEmail(primary.Email))
-	}
-	if primary.AuthStatus != authStatusAuthorized {
-		return nil, fmt.Errorf("primary mailbox is not authorized: %s auth_status=%s", redactEmail(primary.Email), primary.AuthStatus)
-	}
-	return primary.toProto(), nil
+	return row.toProto(), nil
 }
 
 func (s *MailboxStore) UpdateMailboxTokens(ctx context.Context, email string, refreshToken string, accessToken string) error {
 	email = normalizeEmail(email)
-	_, err := s.pool.Exec(ctx, "UPDATE mailboxes SET refresh_token = $1, access_token = $2, auth_status = $3, last_error = '', updated_at = $4 WHERE email = $5 OR primary_email = $5", strings.TrimSpace(refreshToken), strings.TrimSpace(accessToken), authStatusAuthorized, time.Now().Unix(), email)
+	row, err := scanMailbox(s.pool.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1", email))
+	if err != nil {
+		return err
+	}
+	if err := mailboxProviderUpdateTokens(ctx, s.pool, row.Provider, email, refreshToken, accessToken); err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, "UPDATE mailboxes SET updated_at = $1 WHERE email = $2", time.Now().Unix(), email)
 	return err
 }
 
@@ -893,8 +937,6 @@ func scanMailbox(scanner rowScanner) (*mailboxRow, error) {
 		&row.AccessToken,
 		&row.AuthStatus,
 		&row.LastError,
-		&row.IsPrimary,
-		&row.PrimaryEmail,
 		&row.CreatedAt,
 		&row.UpdatedAt,
 	)
@@ -908,7 +950,7 @@ func (m *mailboxRow) toProto() *pb.EmailMailbox {
 	if m == nil {
 		return nil
 	}
-	return &pb.EmailMailbox{
+	mailbox := &pb.EmailMailbox{
 		EmailAddress: m.Email,
 		Provider:     normalizeEmailProvider(m.Provider),
 		Password:     m.Password,
@@ -916,22 +958,24 @@ func (m *mailboxRow) toProto() *pb.EmailMailbox {
 		AccessToken:  m.AccessToken,
 		AuthStatus:   m.AuthStatus,
 		LastError:    m.LastError,
-		IsPrimary:    m.IsPrimary,
-		PrimaryEmail: m.PrimaryEmail,
 		CreatedAt:    m.CreatedAt,
 		UpdatedAt:    m.UpdatedAt,
+		Domain:       domainForEmail(m.Email),
 	}
+	prepareMailboxProjection(mailbox)
+	return mailbox
 }
 
 func normalizeEmailProvider(provider string) string {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "cf", "cloudflare", "cloudflare-email-relay":
-		return emailProviderCloudflare
-	case "outlook", "microsoft", "graph":
-		return emailProviderOutlook
-	default:
-		return strings.ToLower(strings.TrimSpace(provider))
+	return normalizeMailboxProviderInput(provider)
+}
+
+func domainForEmail(email string) string {
+	_, domain, ok := strings.Cut(normalizeEmail(email), "@")
+	if !ok {
+		return ""
 	}
+	return domain
 }
 
 func stableMessageKey(provider string, mailboxEmail string, value string) string {

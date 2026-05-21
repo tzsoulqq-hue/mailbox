@@ -12,8 +12,8 @@ message EmailMailbox {
   reserved 5, 6;
   reserved "status";
   string last_error = 7;
-  bool is_primary = 8;
-  string primary_email = 9;
+  reserved 8, 9;
+  reserved "is_primary", "primary_email";
   int64 created_at = 10;
   int64 updated_at = 11;
   reserved 12, 13, 14, 16, 17;
@@ -21,6 +21,24 @@ message EmailMailbox {
     "latest_otp_provider", "latest_otp_source_mailbox_email";
   string auth_status = 15;
   string provider = 18;
+  EmailSignal latest_signal = 19;
+  string domain = 20;
+}
+
+enum EmailSignalKind {
+  EMAIL_SIGNAL_KIND_UNSPECIFIED = 0;
+  EMAIL_SIGNAL_KIND_OTP = 1;
+  reserved 2, 3;
+}
+
+message EmailSignal {
+  EmailSignalKind kind = 1;
+  string code = 2;
+  string label = 3;
+  string profile = 4;
+  string parser = 5;
+  int32 confidence = 6;
+  string evidence = 7;
 }
 
 message MarkEmailAuthStatusRequest {
@@ -66,6 +84,8 @@ message WaitForEmailRequest {
   string subject_keyword = 2;
   int32 timeout_seconds = 3;
   int64 issued_after_unix = 4;
+  string parser_profile = 5;
+  EmailSignalKind signal_kind = 6;
 }
 
 message WaitForEmailResponse {
@@ -88,6 +108,8 @@ message EmailInboxMessage {
   string body_text = 12;
   string html_body = 13;
   int64 raw_size = 14;
+  repeated EmailSignal signals = 15;
+  EmailSignal primary_signal = 16;
 }
 
 message InboundEmailWebhook {
@@ -110,6 +132,8 @@ message FetchInboxesRequest {
   int32 limit_per_mailbox = 1;
   int32 max_mailboxes = 2;
   string email_address = 3;
+  string parser_profile = 4;
+  int64 received_after_unix = 5;
 }
 
 message FetchMailboxInboxResult {

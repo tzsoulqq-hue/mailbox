@@ -291,9 +291,23 @@ func (r *outlookRegistrationRunner) runOutlookRegisterStepLoop(ctx context.Conte
 }
 
 func (r *outlookRegistrationRunner) solveOutlookCaptcha(ctx context.Context, session string) error {
-	attempts := envPositiveInt("OUTLOOK_REGISTER_CAPTCHA_ATTEMPTS", 3)
-	if attempts > 5 {
-		attempts = 5
+	attempts := envPositiveInt("OUTLOOK_REGISTER_CAPTCHA_ATTEMPTS", 5)
+	if attempts > 8 {
+		attempts = 8
+	}
+	holdDuration := envDurationSeconds("OUTLOOK_REGISTER_CAPTCHA_HOLD_SECONDS", 9*time.Second)
+	if holdDuration < 5*time.Second {
+		holdDuration = 5 * time.Second
+	}
+	if holdDuration > 15*time.Second {
+		holdDuration = 15 * time.Second
+	}
+	waitAfterHold := envDurationSeconds("OUTLOOK_REGISTER_CAPTCHA_WAIT_SECONDS", 12*time.Second)
+	if waitAfterHold < 3*time.Second {
+		waitAfterHold = 3 * time.Second
+	}
+	if waitAfterHold > 30*time.Second {
+		waitAfterHold = 30 * time.Second
 	}
 	var lastErr error
 	for i := 0; i < attempts; i++ {
@@ -305,22 +319,42 @@ func (r *outlookRegistrationRunner) solveOutlookCaptcha(ctx context.Context, ses
 				cssSelector("button:has-text('Press')"),
 				textSelector("Press and hold"),
 				textSelector("Press again"),
-			}, 5*time.Second, 6500*time.Millisecond),
+			}, 5*time.Second, holdDuration),
 			evaluateCommand("captcha-after-wait", `async () => {
-				await new Promise((resolve) => setTimeout(resolve, 8000));
+				const waitMs = Number(args.waitMs || 12000);
+				await new Promise((resolve) => setTimeout(resolve, waitMs));
 				const text = document.body ? document.body.innerText || "" : "";
-				return {url: location.href, text: text.slice(0, 500)};
-			}`, nil, 12*time.Second),
+				const visible = (el) => {
+					if (!el) return false;
+					const style = getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+				};
+				const pressControls = Array.from(document.querySelectorAll("button,[role='button'],input,[aria-label]"))
+					.filter((el) => visible(el) && /press|hold|again/i.test([el.innerText, el.value, el.getAttribute("aria-label")].filter(Boolean).join(" ")))
+					.slice(0, 10)
+					.map((el) => ({
+						tag: el.tagName,
+						text: (el.innerText || el.value || el.getAttribute("aria-label") || "").slice(0, 100),
+						aria: (el.getAttribute("aria-label") || "").slice(0, 100)
+					}));
+				return {url: location.href, text: text.slice(0, 800), pressControls};
+			}`, map[string]any{"waitMs": waitAfterHold.Milliseconds()}, waitAfterHold+5*time.Second),
 		})
 		if err != nil {
 			lastErr = err
 		} else {
 			state := commandResultMap(results, "captcha-after-wait")
 			text := stringMapValue(state, "text")
-			if !strings.Contains(strings.ToLower(text), "press and hold") && !strings.Contains(strings.ToLower(text), "prove you're human") {
+			var pressControls []any
+			if state != nil {
+				pressControls, _ = state["pressControls"].([]any)
+			}
+			lowerText := strings.ToLower(text)
+			if len(pressControls) == 0 && !strings.Contains(lowerText, "press and hold") && !strings.Contains(lowerText, "prove you're human") {
 				return nil
 			}
-			lastErr = errors.New("captcha press-and-hold did not clear challenge")
+			lastErr = fmt.Errorf("captcha press-and-hold did not clear challenge url=%s text=%q", stringMapValue(state, "url"), strings.TrimSpace(text))
 		}
 		select {
 		case <-ctx.Done():
@@ -508,7 +542,7 @@ func (r *outlookRegistrationRunner) startSession(ctx context.Context, email stri
 	}
 	if workflow == "register" && envBool("OUTLOOK_REGISTER_BLOCK_BROWSER_RESOURCES", true) {
 		labels["camoufox.block_resources"] = "true"
-		labels["camoufox.block_resource_types"] = envDefault("OUTLOOK_REGISTER_BLOCK_RESOURCE_TYPES", "image,font,media")
+		labels["camoufox.block_resource_types"] = envDefault("OUTLOOK_REGISTER_BLOCK_RESOURCE_TYPES", "font,media")
 		labels["camoufox.block_url_patterns"] = envDefault("OUTLOOK_REGISTER_BLOCK_URL_PATTERNS", "gvt1.com,edgedl.me.gvt1.com,google-analytics.com,googletagmanager.com,clarity.ms,bat.bing.com,events.data.microsoft.com,arc.msn.com,collector.azure.com")
 	}
 	resp, err := r.browserClient.StartBrowserSession(reqCtx, &browserautomationv1.StartBrowserSessionRequest{

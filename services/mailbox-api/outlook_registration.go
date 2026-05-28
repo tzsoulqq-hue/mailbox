@@ -66,6 +66,7 @@ type mailboxRecord struct {
 	homeCountry  string
 	homeIP       string
 	proxyProfile string
+	lastError    string
 }
 
 type oauthResult struct {
@@ -152,6 +153,7 @@ func (r *outlookRegistrationRunner) RunMailboxRegistrationWithProgress(ctx conte
 			HomeIp:                 record.homeIP,
 			ProxyProfile:           record.proxyProfile,
 			ManualRecoveryRequired: strings.TrimSpace(record.refreshToken) == "",
+			LastError:              record.lastError,
 		})
 	}
 	response.Success = len(response.GetAccounts()) > 0
@@ -184,7 +186,7 @@ func (r *outlookRegistrationRunner) registerOutlookAccount(ctx context.Context, 
 	}
 
 	progressStep(progress, "registration_start_browser")
-	session, proxySession, err := r.startSession(ctx, email, homeCountry, "register", true)
+	session, proxySession, proxyIP, err := r.startSession(ctx, email, homeCountry, "register", true)
 	if err != nil {
 		return mailboxRecord{}, err
 	}
@@ -233,13 +235,15 @@ func (r *outlookRegistrationRunner) registerOutlookAccount(ctx context.Context, 
 		password:     password,
 		source:       "browser_automation",
 		homeCountry:  homeCountry,
+		homeIP:       proxyIP,
 		proxyProfile: proxySession,
 	}
 	if envBool("OUTLOOK_REGISTER_ENABLE_OAUTH2", true) {
 		progressStep(progress, "registration_oauth")
-		tokens, err := r.runBrowserOAuth(ctx, email, password, homeCountry, true)
+		tokens, err := r.runBrowserOAuthInSession(ctx, session, email, password, "")
 		if err != nil {
 			record.source = "browser_automation_oauth_pending"
+			record.lastError = "registered mailbox has no OAuth refresh token: " + err.Error()
 			return record, nil
 		}
 		record.refreshToken = tokens.refreshToken
@@ -419,25 +423,41 @@ func (r *outlookRegistrationRunner) RunMailboxOAuth(ctx context.Context, req *pb
 }
 
 func (r *outlookRegistrationRunner) runBrowserOAuth(ctx context.Context, email string, password string, homeCountry string, reuseCurrentProxy bool) (oauthResult, error) {
-	session, _, err := r.startSession(ctx, email, homeCountry, "oauth", !reuseCurrentProxy)
+	session, _, _, err := r.startSession(ctx, email, homeCountry, "oauth", !reuseCurrentProxy)
 	if err != nil {
 		return oauthResult{}, err
 	}
 	defer r.stopSession(session)
 
+	return r.runBrowserOAuthInSession(ctx, session, email, password, "login")
+}
+
+func (r *outlookRegistrationRunner) runBrowserOAuthInSession(ctx context.Context, session string, email string, password string, prompt string) (oauthResult, error) {
 	state := uuid.NewString()
-	authURL := r.oauthAuthorizeURL(state)
+	authURL := r.oauthAuthorizeURL(state, prompt)
+	timeout := envDurationSeconds("OUTLOOK_REGISTER_OAUTH_COMMAND_TIMEOUT_SECONDS", r.cfg.commandTimeout)
+	if timeout < r.cfg.commandTimeout {
+		timeout = r.cfg.commandTimeout
+	}
 	results, err := r.execute(ctx, session, "outlook.oauth", []*browserautomationv1.BrowserCommand{
-		navigateCommand("open-oauth", authURL, r.cfg.commandTimeout),
+		navigateCommand("open-oauth", authURL, timeout),
 		evaluateCommand("complete-oauth", outlookOAuthScript, map[string]any{
 			"email":    email,
 			"password": password,
-		}, r.cfg.commandTimeout),
+		}, timeout),
 	})
 	if err != nil {
 		return oauthResult{}, err
 	}
-	resultURL := stringMapValue(commandResultMap(results, "complete-oauth"), "url")
+	result := commandResultMap(results, "complete-oauth")
+	resultState := stringMapValue(result, "state")
+	if resultState == "needs_manual_verification" {
+		return oauthResult{}, fmt.Errorf("OAuth needs manual verification: %s", sanitizeURL(stringMapValue(result, "url")))
+	}
+	if resultState == "timeout" {
+		return oauthResult{}, fmt.Errorf("OAuth browser flow timed out: %s", sanitizeURL(stringMapValue(result, "url")))
+	}
+	resultURL := stringMapValue(result, "url")
 	if resultURL == "" {
 		return oauthResult{}, errors.New("OAuth browser flow did not return a redirect URL")
 	}
@@ -469,7 +489,7 @@ func (r *outlookRegistrationRunner) StartManualRecovery(ctx context.Context, mai
 	if mailbox == nil || normalizeEmail(mailbox.GetEmailAddress()) == "" {
 		return outlookManualRecoverySession{}, errors.New("mailbox email_address is required")
 	}
-	sessionID, proxySession, err := r.startSession(ctx, mailbox.GetEmailAddress(), mailbox.GetHomeCountry(), "manual_recovery", true)
+	sessionID, proxySession, _, err := r.startSession(ctx, mailbox.GetEmailAddress(), mailbox.GetHomeCountry(), "manual_recovery", true)
 	if err != nil {
 		return outlookManualRecoverySession{}, err
 	}
@@ -507,7 +527,7 @@ func (r *outlookRegistrationRunner) PrepareLocalManualRecovery(ctx context.Conte
 		email:         email,
 		sessionID:     "local-visible-browser",
 		proxyCountry:  country,
-		proxySession:  proxySession,
+		proxySession:  proxySession.Hash,
 		localProxyURL: localProxyURL,
 		recoveryURL:   recoveryURL,
 		launchCommand: command,
@@ -515,17 +535,19 @@ func (r *outlookRegistrationRunner) PrepareLocalManualRecovery(ctx context.Conte
 	}, nil
 }
 
-func (r *outlookRegistrationRunner) startSession(ctx context.Context, email string, homeCountry string, workflow string, rotateProxy bool) (string, string, error) {
+func (r *outlookRegistrationRunner) startSession(ctx context.Context, email string, homeCountry string, workflow string, rotateProxy bool) (string, string, string, error) {
 	if r.browserClient == nil {
-		return "", "", errors.New("browser-automation client is not initialized")
+		return "", "", "", errors.New("browser-automation client is not initialized")
 	}
 	proxySession := ""
+	proxyIP := ""
 	if rotateProxy && r.outlookProxy != nil && r.outlookProxy.enabled() {
-		hash, err := r.outlookProxy.rotateSession(ctx, email, homeCountry)
+		session, err := r.outlookProxy.rotateSession(ctx, email, homeCountry)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
-		proxySession = hash
+		proxySession = session.Hash
+		proxyIP = session.IP
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, r.cfg.commandTimeout)
 	defer cancel()
@@ -565,16 +587,16 @@ func (r *outlookRegistrationRunner) startSession(ctx context.Context, email stri
 		Ttl: durationpb.New(r.cfg.sessionTTL),
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if resp.GetError() != nil {
-		return "", "", errors.New(resp.GetError().GetMessage())
+		return "", "", "", errors.New(resp.GetError().GetMessage())
 	}
 	sessionID := resp.GetSession().GetSessionId()
 	if sessionID == "" {
-		return "", "", errors.New("browser-automation returned empty session_id")
+		return "", "", "", errors.New("browser-automation returned empty session_id")
 	}
-	return sessionID, proxySession, nil
+	return sessionID, proxySession, proxyIP, nil
 }
 
 func (r *outlookRegistrationRunner) stopSession(sessionID string) {
@@ -642,7 +664,7 @@ func browserCommandsTimeout(commands []*browserautomationv1.BrowserCommand, fall
 	return maxTimeout
 }
 
-func (r *outlookRegistrationRunner) oauthAuthorizeURL(state string) string {
+func (r *outlookRegistrationRunner) oauthAuthorizeURL(state string, prompt string) string {
 	values := url.Values{}
 	values.Set("client_id", r.cfg.oauthClientID)
 	values.Set("response_type", "code")
@@ -650,7 +672,9 @@ func (r *outlookRegistrationRunner) oauthAuthorizeURL(state string) string {
 	values.Set("response_mode", "query")
 	values.Set("scope", strings.Join(r.cfg.oauthScopes, " "))
 	values.Set("state", state)
-	values.Set("prompt", "login")
+	if strings.TrimSpace(prompt) != "" {
+		values.Set("prompt", strings.TrimSpace(prompt))
+	}
 	return defaultOutlookOAuthAuthorizeURL + "?" + values.Encode()
 }
 
@@ -716,6 +740,7 @@ func registrationResponse(records []mailboxRecord, err error) *pb.RunMailboxRegi
 			HomeCountry:  record.homeCountry,
 			HomeIp:       record.homeIP,
 			ProxyProfile: record.proxyProfile,
+			LastError:    record.lastError,
 		})
 	}
 	errorMessage := ""

@@ -27,6 +27,7 @@ message MailboxRegistrationAccount {
   string home_ip = 7;
   string proxy_profile = 8;
   bool manual_recovery_required = 9;
+  string last_error = 10;
 }
 
 message RunMailboxOAuthRequest {

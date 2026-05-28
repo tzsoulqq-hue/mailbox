@@ -236,7 +236,7 @@ func (a *mailboxActivities) persistRegisteredAccounts(ctx context.Context, accou
 			RefreshToken:           strings.TrimSpace(account.GetRefreshToken()),
 			AccessToken:            strings.TrimSpace(account.GetAccessToken()),
 			AuthStatus:             mailboxAuthStatus(account.GetRefreshToken(), ""),
-			LastError:              "",
+			LastError:              strings.TrimSpace(account.GetLastError()),
 			HomeCountry:            strings.ToUpper(strings.TrimSpace(account.GetHomeCountry())),
 			HomeIp:                 strings.TrimSpace(account.GetHomeIp()),
 			ProxyProfile:           strings.TrimSpace(account.GetProxyProfile()),

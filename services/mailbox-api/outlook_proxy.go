@@ -39,6 +39,11 @@ type outlookProxySessionResponse struct {
 	} `json:"pool"`
 }
 
+type outlookProxySessionInfo struct {
+	Hash string
+	IP   string
+}
+
 func newOutlookProxyManagerFromEnv() *outlookProxyManager {
 	proxyURL := strings.TrimSpace(envStr("OUTLOOK_PROXY_URL", ""))
 	runtimeURL := strings.TrimRight(strings.TrimSpace(envStr("OUTLOOK_PROXY_RUNTIME_HTTP_ADDR", "")), "/")
@@ -85,11 +90,11 @@ func (m *outlookProxyManager) clientForMailbox(ctx context.Context, email string
 	}
 	sessionHash := ""
 	if m.rotateEachUse && m.runtimeHTTPURL != "" {
-		hash, err := m.rotateSession(ctx, email, country)
+		session, err := m.rotateSession(ctx, email, country)
 		if err != nil {
 			return nil, "", err
 		}
-		sessionHash = hash
+		sessionHash = session.Hash
 	}
 	client, err := httpClientForProxyURL(m.proxyURL, m.timeout)
 	if err != nil {
@@ -98,7 +103,7 @@ func (m *outlookProxyManager) clientForMailbox(ctx context.Context, email string
 	return client, sessionHash, nil
 }
 
-func (m *outlookProxyManager) rotateSession(ctx context.Context, email string, country string) (string, error) {
+func (m *outlookProxyManager) rotateSession(ctx context.Context, email string, country string) (outlookProxySessionInfo, error) {
 	email = normalizeEmail(email)
 	region := firstNonEmpty(strings.TrimSpace(country), strings.TrimSpace(m.region))
 	attempts := 1
@@ -106,33 +111,35 @@ func (m *outlookProxyManager) rotateSession(ctx context.Context, email string, c
 		attempts = m.speedAttempts
 	}
 	var lastErr error
-	var lastHash string
+	var lastSession outlookProxySessionInfo
 	for attempt := 1; attempt <= attempts; attempt++ {
 		sessionID, err := m.createSession(ctx, email, region)
 		if err != nil {
-			return "", err
+			return outlookProxySessionInfo{}, err
 		}
 		if sessionID == "" {
-			return "", nil
+			return outlookProxySessionInfo{}, nil
 		}
-		lastHash = shortValueHash(sessionID)
+		lastSession = outlookProxySessionInfo{Hash: shortValueHash(sessionID)}
 		if !m.speedCheck || strings.TrimSpace(m.proxyURL) == "" {
-			return lastHash, nil
+			lastSession.IP = m.discoverProxyIP(ctx)
+			return lastSession, nil
 		}
 		elapsed, err := m.probeSpeed(ctx)
 		if err == nil && elapsed <= m.speedMaxTime {
-			return lastHash, nil
+			lastSession.IP = m.discoverProxyIP(ctx)
+			return lastSession, nil
 		}
 		if err != nil {
-			lastErr = fmt.Errorf("outlook proxy speed probe failed attempt=%d session=%s: %w", attempt, lastHash, err)
+			lastErr = fmt.Errorf("outlook proxy speed probe failed attempt=%d session=%s: %w", attempt, lastSession.Hash, err)
 		} else {
-			lastErr = fmt.Errorf("outlook proxy speed probe too slow attempt=%d session=%s elapsed=%s threshold=%s", attempt, lastHash, elapsed.Round(time.Millisecond), m.speedMaxTime)
+			lastErr = fmt.Errorf("outlook proxy speed probe too slow attempt=%d session=%s elapsed=%s threshold=%s", attempt, lastSession.Hash, elapsed.Round(time.Millisecond), m.speedMaxTime)
 		}
 	}
 	if lastErr != nil {
-		return "", lastErr
+		return outlookProxySessionInfo{}, lastErr
 	}
-	return lastHash, nil
+	return lastSession, nil
 }
 
 func (m *outlookProxyManager) createSession(ctx context.Context, email string, region string) (string, error) {
@@ -201,6 +208,37 @@ func (m *outlookProxyManager) probeSpeed(ctx context.Context) (time.Duration, er
 		return time.Since(started), fmt.Errorf("status=%d", resp.StatusCode)
 	}
 	return time.Since(started), nil
+}
+
+func (m *outlookProxyManager) discoverProxyIP(ctx context.Context) string {
+	client, err := httpClientForProxyURL(m.proxyURL, m.timeout)
+	if err != nil {
+		return ""
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "https://ipinfo.io/ip", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if err != nil {
+		return ""
+	}
+	value := strings.TrimSpace(string(raw))
+	if net.ParseIP(value) == nil {
+		return ""
+	}
+	return value
 }
 
 func httpClientForProxyURL(rawURL string, timeout time.Duration) (*http.Client, error) {

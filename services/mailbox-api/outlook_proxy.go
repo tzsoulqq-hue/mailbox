@@ -18,16 +18,18 @@ import (
 )
 
 type outlookProxyManager struct {
-	proxyURL       string
-	runtimeHTTPURL string
-	region         string
-	stickyMinutes  int
-	rotateEachUse  bool
-	timeout        time.Duration
-	speedCheck     bool
-	speedURL       string
-	speedMaxTime   time.Duration
-	speedAttempts  int
+	proxyURL          string
+	runtimeHTTPURL    string
+	region            string
+	stickyMinutes     int
+	rotateEachUse     bool
+	timeout           time.Duration
+	speedCheck        bool
+	speedURL          string
+	speedMaxTime      time.Duration
+	speedProbeTimeout time.Duration
+	speedAttempts     int
+	speedStrict       bool
 }
 
 type outlookProxySessionResponse struct {
@@ -62,21 +64,27 @@ func newOutlookProxyManagerFromEnv() *outlookProxyManager {
 	if speedMaxMillis <= 0 {
 		speedMaxMillis = 500
 	}
+	speedProbeTimeoutMillis := envInt("OUTLOOK_PROXY_SPEED_PROBE_TIMEOUT_MILLIS", 3000)
+	if speedProbeTimeoutMillis <= 0 {
+		speedProbeTimeoutMillis = 3000
+	}
 	speedAttempts := envInt("OUTLOOK_PROXY_SPEED_ATTEMPTS", 4)
 	if speedAttempts <= 0 {
 		speedAttempts = 4
 	}
 	return &outlookProxyManager{
-		proxyURL:       proxyURL,
-		runtimeHTTPURL: runtimeURL,
-		region:         envStr("OUTLOOK_PROXY_REGION", "ID"),
-		stickyMinutes:  stickyMinutes,
-		rotateEachUse:  envBool("OUTLOOK_PROXY_ROTATE_EACH_FETCH", false),
-		timeout:        time.Duration(timeoutSeconds) * time.Second,
-		speedCheck:     envBool("OUTLOOK_PROXY_SPEED_CHECK_ENABLED", true),
-		speedURL:       envStr("OUTLOOK_PROXY_SPEED_CHECK_URL", "https://login.live.com/favicon.ico"),
-		speedMaxTime:   time.Duration(speedMaxMillis) * time.Millisecond,
-		speedAttempts:  speedAttempts,
+		proxyURL:          proxyURL,
+		runtimeHTTPURL:    runtimeURL,
+		region:            envStr("OUTLOOK_PROXY_REGION", "ID"),
+		stickyMinutes:     stickyMinutes,
+		rotateEachUse:     envBool("OUTLOOK_PROXY_ROTATE_EACH_FETCH", false),
+		timeout:           time.Duration(timeoutSeconds) * time.Second,
+		speedCheck:        envBool("OUTLOOK_PROXY_SPEED_CHECK_ENABLED", true),
+		speedURL:          envStr("OUTLOOK_PROXY_SPEED_CHECK_URL", "https://login.live.com/favicon.ico"),
+		speedMaxTime:      time.Duration(speedMaxMillis) * time.Millisecond,
+		speedProbeTimeout: time.Duration(speedProbeTimeoutMillis) * time.Millisecond,
+		speedAttempts:     speedAttempts,
+		speedStrict:       envBool("OUTLOOK_PROXY_SPEED_STRICT", false),
 	}
 }
 
@@ -137,7 +145,11 @@ func (m *outlookProxyManager) rotateSession(ctx context.Context, email string, c
 		}
 	}
 	if lastErr != nil {
-		return outlookProxySessionInfo{}, lastErr
+		if m.speedStrict {
+			return outlookProxySessionInfo{}, lastErr
+		}
+		lastSession.IP = m.discoverProxyIP(ctx)
+		return lastSession, nil
 	}
 	return lastSession, nil
 }
@@ -186,11 +198,15 @@ func (m *outlookProxyManager) createSession(ctx context.Context, email string, r
 }
 
 func (m *outlookProxyManager) probeSpeed(ctx context.Context) (time.Duration, error) {
-	client, err := httpClientForProxyURL(m.proxyURL, m.speedMaxTime)
+	probeTimeout := m.speedProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 3 * time.Second
+	}
+	client, err := httpClientForProxyURL(m.proxyURL, probeTimeout)
 	if err != nil {
 		return 0, err
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, m.speedMaxTime)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	started := time.Now()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodHead, m.speedURL, nil)

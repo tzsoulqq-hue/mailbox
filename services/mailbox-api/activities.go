@@ -34,10 +34,17 @@ func (a *mailboxActivities) RunMailboxRegistration(ctx context.Context, input re
 		return mailboxOperationResult{OperationID: operationID, ErrorMessage: err.Error()}, err
 	}
 
-	resp, err := a.outlookRegistration.RunMailboxRegistration(ctx, &pb.RunMailboxRegistrationRequest{
+	progress := func(step string) {
+		a.updateOperation(ctx, operationID, operationUpdate{
+			Status:   operationStatusRunning,
+			LastStep: step,
+		})
+	}
+	resp, err := a.outlookRegistration.RunMailboxRegistrationWithProgress(ctx, &pb.RunMailboxRegistrationRequest{
 		Enabled:    !input.ImportOnly,
 		ImportOnly: input.ImportOnly,
-	})
+		MaxCount:   input.MaxCount,
+	}, progress)
 	if err != nil {
 		message := fmt.Sprintf("run mailbox registration: %v", err)
 		a.updateOperation(ctx, operationID, operationUpdate{
@@ -224,12 +231,16 @@ func (a *mailboxActivities) persistRegisteredAccounts(ctx context.Context, accou
 			return fmt.Errorf("mailbox account missing password: %s", email)
 		}
 		if err := a.upsertMailbox(ctx, &pb.EmailMailbox{
-			EmailAddress: email,
-			Password:     password,
-			RefreshToken: strings.TrimSpace(account.GetRefreshToken()),
-			AccessToken:  strings.TrimSpace(account.GetAccessToken()),
-			AuthStatus:   mailboxAuthStatus(account.GetRefreshToken(), ""),
-			LastError:    "",
+			EmailAddress:           email,
+			Password:               password,
+			RefreshToken:           strings.TrimSpace(account.GetRefreshToken()),
+			AccessToken:            strings.TrimSpace(account.GetAccessToken()),
+			AuthStatus:             mailboxAuthStatus(account.GetRefreshToken(), ""),
+			LastError:              "",
+			HomeCountry:            strings.ToUpper(strings.TrimSpace(account.GetHomeCountry())),
+			HomeIp:                 strings.TrimSpace(account.GetHomeIp()),
+			ProxyProfile:           strings.TrimSpace(account.GetProxyProfile()),
+			ManualRecoveryRequired: account.GetManualRecoveryRequired(),
 		}); err != nil {
 			return err
 		}
@@ -267,11 +278,15 @@ func (a *mailboxActivities) oauthAccounts(ctx context.Context, emailAddress stri
 			continue
 		}
 		accounts = append(accounts, &pb.MailboxRegistrationAccount{
-			EmailAddress: email,
-			Password:     strings.TrimSpace(mailbox.GetPassword()),
-			RefreshToken: strings.TrimSpace(mailbox.GetRefreshToken()),
-			AccessToken:  strings.TrimSpace(mailbox.GetAccessToken()),
-			Source:       "mailboxes",
+			EmailAddress:           email,
+			Password:               strings.TrimSpace(mailbox.GetPassword()),
+			RefreshToken:           strings.TrimSpace(mailbox.GetRefreshToken()),
+			AccessToken:            strings.TrimSpace(mailbox.GetAccessToken()),
+			Source:                 "mailboxes",
+			HomeCountry:            strings.ToUpper(strings.TrimSpace(mailbox.GetHomeCountry())),
+			HomeIp:                 strings.TrimSpace(mailbox.GetHomeIp()),
+			ProxyProfile:           strings.TrimSpace(mailbox.GetProxyProfile()),
+			ManualRecoveryRequired: mailbox.GetManualRecoveryRequired(),
 		})
 		if requestedEmail == "" && int32(len(accounts)) >= selectedLimit {
 			break
@@ -307,6 +322,14 @@ func (a *mailboxActivities) persistOAuthResults(ctx context.Context, results []*
 			existingRefreshToken = strings.TrimSpace(account.GetRefreshToken())
 		}
 		if result.GetSuccess() && refreshToken != "" {
+			homeCountry := ""
+			homeIP := ""
+			proxyProfile := ""
+			if account != nil {
+				homeCountry = account.GetHomeCountry()
+				homeIP = account.GetHomeIp()
+				proxyProfile = account.GetProxyProfile()
+			}
 			if err := a.upsertMailbox(ctx, &pb.EmailMailbox{
 				EmailAddress: email,
 				Password:     password,
@@ -314,6 +337,9 @@ func (a *mailboxActivities) persistOAuthResults(ctx context.Context, results []*
 				AccessToken:  strings.TrimSpace(result.GetAccessToken()),
 				AuthStatus:   emailAuthAuthorized,
 				LastError:    "",
+				HomeCountry:  strings.ToUpper(strings.TrimSpace(homeCountry)),
+				HomeIp:       strings.TrimSpace(homeIP),
+				ProxyProfile: strings.TrimSpace(proxyProfile),
 			}); err != nil {
 				return err
 			}

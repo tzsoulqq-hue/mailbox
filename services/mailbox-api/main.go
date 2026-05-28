@@ -43,6 +43,7 @@ type server struct {
 	workflowTaskQueue string
 	providers         mailboxProviderRuntimeConfig
 	emailEvents       *mailboxEmailEventBus
+	outlookRecovery   *outlookRegistrationRunner
 }
 
 func main() {
@@ -95,6 +96,7 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
+	browserClient := browserautomationv1.NewBrowserAutomationServiceClient(browserConn)
 	pb.RegisterMailboxServiceServer(grpcServer, &server{
 		emailBackend:      emailBackend,
 		operations:        operations,
@@ -102,6 +104,7 @@ func main() {
 		workflowTaskQueue: cfg.workflowRuntime.TaskQueue,
 		providers:         cfg.providers,
 		emailEvents:       emailEvents,
+		outlookRecovery:   newOutlookRegistrationRunner(cfg.providers.registration, browserClient, nil),
 	})
 
 	go func() {
@@ -262,6 +265,7 @@ func (s *server) RegisterMailbox(ctx context.Context, req *pb.RegisterMailboxReq
 	if err := s.startMailboxWorkflow(ctx, operationID, registerMailboxWorkflowName, registerMailboxWorkflowInput{
 		OperationID: operationID,
 		ImportOnly:  req.GetImportOnly(),
+		MaxCount:    req.GetMaxCount(),
 	}); err != nil {
 		s.updateOperation(ctx, operationID, operationUpdate{
 			Status:       operationStatusFailed,
@@ -304,6 +308,49 @@ func (s *server) RunMailboxOAuth(ctx context.Context, req *pb.StartMailboxOAuthR
 	return &pb.StartMailboxOAuthResponse{
 		OperationId: operationID,
 		Started:     true,
+	}, nil
+}
+
+func (s *server) StartMailboxManualRecovery(ctx context.Context, req *pb.StartMailboxManualRecoveryRequest) (*pb.StartMailboxManualRecoveryResponse, error) {
+	email := normalizeEmail(req.GetEmailAddress())
+	if email == "" {
+		return &pb.StartMailboxManualRecoveryResponse{Started: false, ErrorMessage: "email_address is required"}, nil
+	}
+	if s.outlookRecovery == nil {
+		return &pb.StartMailboxManualRecoveryResponse{EmailAddress: email, Started: false, ErrorMessage: "Outlook recovery is not configured"}, nil
+	}
+	resp, err := s.emailBackend.ListMailboxes(ctx, &pb.ListEmailMailboxesRequest{Provider: emailProviderOutlook, Limit: 500})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "list Outlook mailboxes: %v", err)
+	}
+	var mailbox *pb.EmailMailbox
+	for _, candidate := range resp.GetMailboxes() {
+		if normalizeEmail(candidate.GetEmailAddress()) == email {
+			mailbox = candidate
+			break
+		}
+	}
+	if mailbox == nil {
+		return &pb.StartMailboxManualRecoveryResponse{EmailAddress: email, Started: false, ErrorMessage: "mailbox not found"}, nil
+	}
+	if strings.TrimSpace(mailbox.GetHomeCountry()) == "" {
+		return &pb.StartMailboxManualRecoveryResponse{EmailAddress: email, Started: false, ErrorMessage: "mailbox home_country is required for manual recovery"}, nil
+	}
+	session, err := s.outlookRecovery.PrepareLocalManualRecovery(ctx, mailbox)
+	if err != nil {
+		return &pb.StartMailboxManualRecoveryResponse{EmailAddress: email, Started: false, ErrorMessage: err.Error()}, nil
+	}
+	return &pb.StartMailboxManualRecoveryResponse{
+		EmailAddress:  session.email,
+		SessionId:     session.sessionID,
+		ProxyCountry:  session.proxyCountry,
+		ProxySession:  session.proxySession,
+		Started:       true,
+		ErrorMessage:  "",
+		LocalProxyUrl: session.localProxyURL,
+		RecoveryUrl:   session.recoveryURL,
+		LaunchCommand: session.launchCommand,
+		Instruction:   session.instruction,
 	}, nil
 }
 

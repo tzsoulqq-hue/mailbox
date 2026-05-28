@@ -26,6 +26,7 @@ const (
 type registerMailboxWorkflowInput struct {
 	OperationID string
 	ImportOnly  bool
+	MaxCount    int32
 }
 
 type mailboxOAuthWorkflowInput struct {

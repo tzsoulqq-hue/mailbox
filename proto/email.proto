@@ -23,6 +23,13 @@ message EmailMailbox {
   string provider = 18;
   EmailSignal latest_signal = 19;
   string domain = 20;
+  string home_country = 21;
+  string home_ip = 22;
+  string proxy_profile = 23;
+  string last_proxy_country = 24;
+  string last_proxy_session = 25;
+  string last_proxy_ip = 26;
+  bool manual_recovery_required = 27;
 }
 
 enum EmailSignalKind {

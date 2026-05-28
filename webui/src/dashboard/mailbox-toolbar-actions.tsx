@@ -1,4 +1,4 @@
-import { Eye, EyeOff, Inbox, KeyRound, Plus, RefreshCcw } from 'lucide-react';
+import { Eye, EyeOff, Inbox, KeyRound, MailPlus, Plus, RefreshCcw } from 'lucide-react';
 import type { ToolbarActionDescriptor } from '@/dashboard/module-kit';
 import { actionKey, bulkMailboxActionCount, mailboxActions, type MailboxActionKey, type MailboxProviderTab } from './mailbox-utils';
 import type { Mailbox, MailboxProviderActionCapability, MailboxProviderCapability } from './types';
@@ -12,9 +12,11 @@ type ProviderToolbarView = {
 type ProviderToolbarProps = {
   busy: boolean;
   showSecrets: boolean;
+  registering: boolean;
   oauthing: string;
   inboxLoading: boolean;
   domainSyncing: boolean;
+  onRegisterMailbox: (maxCount?: number) => Promise<void>;
   onOAuth: (emailAddress?: string) => Promise<void>;
   onFetchInbox: () => Promise<void>;
   onSyncDomains: () => Promise<void>;
@@ -64,14 +66,25 @@ const toolbarActionFactories: Partial<Record<MailboxActionKey, ToolbarActionFact
   }),
 };
 
-export function providerToolbarActions(view: ProviderToolbarView, props: ProviderToolbarProps, openImport: (provider: MailboxProviderTab) => void) {
+export function providerToolbarActions(view: ProviderToolbarView, props: ProviderToolbarProps, openImport: (provider: MailboxProviderTab) => void, registerCount = 1) {
   const actions = (view.capability?.actions || [])
     .map((action) => {
       const key = actionKey(action.action);
       return key ? toolbarActionFactories[key]?.({ action, view, props, openImport }) : undefined;
     })
     .filter((action): action is ToolbarActionDescriptor => !!action);
-  return [...actions, secretsAction(props)];
+  const providerActions = view.value === 'outlook' ? [registerMailboxAction(props, registerCount), ...actions] : actions;
+  return [...providerActions, secretsAction(props)];
+}
+
+function registerMailboxAction(props: ProviderToolbarProps, registerCount: number): ToolbarActionDescriptor {
+  return {
+    id: 'register-mailbox',
+    label: props.registering ? '注册中' : `注册 Outlook · ${registerCount}`,
+    icon: <MailPlus className="size-4" />,
+    disabled: props.busy || props.registering,
+    onClick: () => void props.onRegisterMailbox(registerCount),
+  };
 }
 
 function secretsAction(props: ProviderToolbarProps): ToolbarActionDescriptor {

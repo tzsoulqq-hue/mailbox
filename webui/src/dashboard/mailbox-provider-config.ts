@@ -24,7 +24,7 @@ export const mailboxProviderConfigs = [{
   showStatus: true,
   import: {
     description: 'Outlook 可附带密码或 OAuth token。',
-    batchPlaceholder: 'account@example.com----password',
+    batchPlaceholder: 'account@example.com----password\naccount@example.com---password---refresh_token---access_token',
     allowPlainEmailBatch: false,
     credentialFields: ['password', 'refresh_token', 'access_token'],
   },

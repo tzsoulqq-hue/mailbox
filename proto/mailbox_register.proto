@@ -7,6 +7,7 @@ option go_package = "./;pb";
 message RunMailboxRegistrationRequest {
   bool enabled = 1;
   bool import_only = 2;
+  int32 max_count = 3;
 }
 
 message RunMailboxRegistrationResponse {
@@ -22,6 +23,10 @@ message MailboxRegistrationAccount {
   string refresh_token = 3;
   string access_token = 4;
   string source = 5;
+  string home_country = 6;
+  string home_ip = 7;
+  string proxy_profile = 8;
+  bool manual_recovery_required = 9;
 }
 
 message RunMailboxOAuthRequest {

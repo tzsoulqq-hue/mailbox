@@ -10,6 +10,11 @@ export type MailboxActionKey = 'import_mailbox' | 'run_oauth' | 'fetch_inbox' | 
 export type MailboxBatchItem = {
   email: string;
   password: string;
+  refresh_token?: string;
+  access_token?: string;
+  home_country?: string;
+  home_ip?: string;
+  proxy_profile?: string;
 };
 
 export const mailboxActions = {
@@ -77,6 +82,24 @@ export function parseMailboxBatch(value: string, provider: string) {
   value.split(/\r?\n/).forEach((raw, index) => {
     const line = raw.trim();
     if (!line) return;
+    const tokenParts = line.split('---');
+    if (tokenParts.length >= 3) {
+      const email = tokenParts[0].trim();
+      if (!email) {
+        errors.push(`第 ${index + 1} 行缺少账号`);
+        return;
+      }
+      items.push({
+        email,
+        password: tokenParts[1].trim(),
+        refresh_token: tokenParts[2].trim(),
+        access_token: tokenParts[3]?.trim() || '',
+        home_country: tokenParts[4]?.trim() || '',
+        home_ip: tokenParts[5]?.trim() || '',
+        proxy_profile: tokenParts[6]?.trim() || '',
+      });
+      return;
+    }
     const delimiterIndex = line.indexOf('----');
     if (allowPlainEmailBatch && delimiterIndex < 0) {
       items.push({ email: line, password: '' });

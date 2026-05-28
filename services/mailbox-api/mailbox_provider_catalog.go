@@ -50,11 +50,18 @@ type mailboxProviderDefinition struct {
 }
 
 type mailboxProviderSelectFields struct {
-	password     string
-	refreshToken string
-	accessToken  string
-	authStatus   string
-	lastError    string
+	password               string
+	refreshToken           string
+	accessToken            string
+	authStatus             string
+	lastError              string
+	homeCountry            string
+	homeIP                 string
+	proxyProfile           string
+	lastProxyCountry       string
+	lastProxySession       string
+	lastProxyIP            string
+	manualRecoveryRequired string
 }
 
 type mailboxInboxRetention struct {
@@ -279,18 +286,34 @@ func mailboxSelectSQL() string {
 		%s AS access_token,
 		%s AS auth_status,
 		%s AS last_error,
+		%s AS home_country,
+		%s AS home_ip,
+		%s AS proxy_profile,
+		%s AS last_proxy_country,
+		%s AS last_proxy_session,
+		%s AS last_proxy_ip,
+		%s AS manual_recovery_required,
 		m.created_at, m.updated_at
 	FROM mailboxes m%s
-`, fields.password, fields.refreshToken, fields.accessToken, fields.authStatus, fields.lastError, joins)
+`, fields.password, fields.refreshToken, fields.accessToken, fields.authStatus, fields.lastError,
+		fields.homeCountry, fields.homeIP, fields.proxyProfile, fields.lastProxyCountry,
+		fields.lastProxySession, fields.lastProxyIP, fields.manualRecoveryRequired, joins)
 }
 
 func mailboxProviderFieldExpressions() mailboxProviderSelectFields {
 	expressions := mailboxProviderSelectFields{
-		password:     "''",
-		refreshToken: "''",
-		accessToken:  "''",
-		authStatus:   "''",
-		lastError:    "''",
+		password:               "''",
+		refreshToken:           "''",
+		accessToken:            "''",
+		authStatus:             "''",
+		lastError:              "''",
+		homeCountry:            "''",
+		homeIP:                 "''",
+		proxyProfile:           "''",
+		lastProxyCountry:       "''",
+		lastProxySession:       "''",
+		lastProxyIP:            "''",
+		manualRecoveryRequired: "FALSE",
 	}
 	for _, provider := range mailboxProviders() {
 		fields := provider.selectFields
@@ -299,6 +322,13 @@ func mailboxProviderFieldExpressions() mailboxProviderSelectFields {
 		expressions.accessToken = coalesceProviderField(expressions.accessToken, fields.accessToken)
 		expressions.authStatus = coalesceProviderField(expressions.authStatus, fields.authStatus)
 		expressions.lastError = coalesceProviderField(expressions.lastError, fields.lastError)
+		expressions.homeCountry = coalesceProviderField(expressions.homeCountry, fields.homeCountry)
+		expressions.homeIP = coalesceProviderField(expressions.homeIP, fields.homeIP)
+		expressions.proxyProfile = coalesceProviderField(expressions.proxyProfile, fields.proxyProfile)
+		expressions.lastProxyCountry = coalesceProviderField(expressions.lastProxyCountry, fields.lastProxyCountry)
+		expressions.lastProxySession = coalesceProviderField(expressions.lastProxySession, fields.lastProxySession)
+		expressions.lastProxyIP = coalesceProviderField(expressions.lastProxyIP, fields.lastProxyIP)
+		expressions.manualRecoveryRequired = coalesceBoolProviderField(expressions.manualRecoveryRequired, fields.manualRecoveryRequired)
 	}
 	return expressions
 }
@@ -312,6 +342,17 @@ func coalesceProviderField(current string, next string) string {
 		return fmt.Sprintf("COALESCE(%s, '')", next)
 	}
 	return fmt.Sprintf("COALESCE(NULLIF(%s, ''), %s)", next, current)
+}
+
+func coalesceBoolProviderField(current string, next string) string {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return current
+	}
+	if current == "FALSE" {
+		return fmt.Sprintf("COALESCE(%s, FALSE)", next)
+	}
+	return fmt.Sprintf("(%s OR COALESCE(%s, FALSE))", current, next)
 }
 
 func mailboxProviderUpsert(ctx context.Context, tx pgx.Tx, provider string, mailbox *pb.EmailMailbox, now int64) error {

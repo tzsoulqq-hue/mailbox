@@ -18,6 +18,8 @@ export function useMailboxActions(data: MailboxData, showSecrets: boolean, setSe
     initialData: null
   });
   const [oauthing, setOAuthing] = useState('');
+  const [registering, setRegistering] = useState(false);
+  const [manualRecoverying, setManualRecoverying] = useState('');
   const [inboxLoading, setInboxLoading] = useState(false);
   const [storedInboxLoading, setStoredInboxLoading] = useState(false);
   const [domainSyncing, setDomainSyncing] = useState(false);
@@ -44,8 +46,22 @@ export function useMailboxActions(data: MailboxData, showSecrets: boolean, setSe
   async function runOAuth(emailAddress = '') {
     setOAuthing(emailAddress || '*');
     try {
+      const target = normalizeUiEmail(emailAddress);
+      const mailbox = target ? data.mailboxes.find((item) => normalizeUiEmail(item.email_address) === target) : null;
+      if (target && mailbox && (mailbox.manual_recovery_required || mailbox.auth_status === 'AUTH_FAILED' || mailbox.auth_status === 'NEEDS_MANUAL_VERIFICATION')) {
+        const resp = await api<{ started: boolean; launch_command: string; error_message: string }>('/api/mailboxes/oauth-local', { method: 'POST', body: JSON.stringify({ email_address: target }) });
+        if (resp.started && resp.launch_command && navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(resp.launch_command).catch(() => undefined);
+        }
+        if (resp.started && resp.launch_command) {
+          window.prompt('Local Camoufox OAuth command copied. Run this in PowerShell:', resp.launch_command);
+        }
+        toast.showToast(!resp.started || resp.error_message ? 'error' : 'ok', resp.error_message || 'Local Camoufox OAuth command copied');
+        await data.invalidate();
+        return;
+      }
       const resp = await api<{ started: boolean; job_id: string; error_message: string }>('/api/mailboxes/oauth', { method: 'POST', body: JSON.stringify({ email_address: emailAddress, only_missing: !emailAddress, limit: 100 }) });
-      toast.showToast(!resp.started || resp.error_message ? 'error' : 'ok', resp.error_message || (!resp.started ? 'OAuth 流程启动失败' : `OAuth 流程已提交: ${short(resp.job_id)}`));
+      toast.showToast(!resp.started || resp.error_message ? 'error' : 'ok', resp.error_message || (!resp.started ? 'OAuth start failed' : `OAuth submitted ${short(resp.job_id)}`));
       await data.invalidate();
     } catch (err) {
       toast.showError(err);
@@ -53,6 +69,24 @@ export function useMailboxActions(data: MailboxData, showSecrets: boolean, setSe
       setOAuthing('');
     }
   }
+
+  async function registerMailbox(maxCount = 1) {
+    setRegistering(true);
+    try {
+      const resp = await api<{ started: boolean; job_id: string; operation_id?: string; error_message: string }>('/api/mailboxes/register', {
+        method: 'POST',
+        body: JSON.stringify({ max_count: Math.max(1, Math.min(5, Math.floor(maxCount || 1))) })
+      });
+      const id = resp.job_id || resp.operation_id || '';
+      toast.showToast(!resp.started || resp.error_message ? 'error' : 'ok', resp.error_message || (!resp.started ? '邮箱注册启动失败' : `邮箱注册已提交 ${short(id)}`));
+      await data.invalidate();
+    } catch (err) {
+      toast.showError(err);
+    } finally {
+      setRegistering(false);
+    }
+  }
+
 
   async function fetchInbox(emailAddress = '') {
     setInboxLoading(true);
@@ -63,12 +97,38 @@ export function useMailboxActions(data: MailboxData, showSecrets: boolean, setSe
         const email = result.mailbox?.email_address || result.messages?.[0]?.mailbox_email || target;
         if (email) queryClient.setQueryData(mailboxInboxQueryKey(email), result);
       }
-      toast.showToast(resp.failed_count > 0 ? 'error' : 'ok', `${target ? `${showSecrets ? target : maskEmail(target)} ` : ''}收信完成：${resp.message_count} 封邮件`);
+      toast.showToast(resp.failed_count > 0 ? 'error' : 'ok', `${target ? `${showSecrets ? target : maskEmail(target)} ` : ''}收信完成，${resp.message_count} 封邮件`);
       await data.invalidate();
     } catch (err) {
       toast.showError(err);
     } finally {
       setInboxLoading(false);
+    }
+  }
+
+  async function startManualRecovery(emailAddress: string) {
+    const target = normalizeUiEmail(emailAddress);
+    if (!target) return;
+    setManualRecoverying(target);
+    try {
+      const resp = await api<{ started: boolean; session_id: string; proxy_country: string; proxy_session: string; local_proxy_url: string; recovery_url: string; launch_command: string; instruction: string; error_message: string }>('/api/mailboxes/recovery', {
+        method: 'POST',
+        body: JSON.stringify({ email_address: target })
+      });
+      const detail = resp.proxy_country ? ` (${resp.proxy_country}${resp.proxy_session ? ' / ' + short(resp.proxy_session) : ''})` : '';
+      if (resp.started && resp.launch_command && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(resp.launch_command).catch(() => undefined);
+      }
+      if (resp.started && resp.launch_command) {
+        window.prompt('Camoufox recovery command copied. Run this in PowerShell:', resp.launch_command);
+      }
+      toast.showToast(!resp.started || resp.error_message ? 'error' : 'ok', resp.error_message || `Manual recovery is ready; local launch command copied${detail}`);
+      await data.invalidate();
+      return;
+    } catch (err) {
+      toast.showError(err);
+    } finally {
+      setManualRecoverying('');
     }
   }
 
@@ -79,7 +139,7 @@ export function useMailboxActions(data: MailboxData, showSecrets: boolean, setSe
         method: 'POST',
         body: JSON.stringify({ provider: 'MAILBOX_PROVIDER_CLOUDFLARE' })
       });
-      toast.showToast(resp.error_message ? 'error' : 'ok', resp.error_message || `Cloudflare 域名已同步: ${resp.synced_count || 0}`);
+      toast.showToast(resp.error_message ? 'error' : 'ok', resp.error_message || `Cloudflare 域名已同步 ${resp.synced_count || 0}`);
       await data.invalidate();
     } catch (err) {
       toast.showError(err);
@@ -101,5 +161,5 @@ export function useMailboxActions(data: MailboxData, showSecrets: boolean, setSe
     await data.invalidate();
   }
 
-  return { toast, inboxResult: inboxQuery.data ?? null, inboxQueryKey: selectedInboxKey, oauthing, inboxLoading: storedInboxLoading || inboxQuery.isFetching || inboxLoading, domainSyncing, runOAuth, fetchInbox, syncCloudflareDomains, deleteMailbox, done };
+  return { toast, inboxResult: inboxQuery.data ?? null, inboxQueryKey: selectedInboxKey, oauthing, registering, manualRecoverying, inboxLoading: storedInboxLoading || inboxQuery.isFetching || inboxLoading, domainSyncing, registerMailbox, runOAuth, startManualRecovery, fetchInbox, syncCloudflareDomains, deleteMailbox, done };
 }

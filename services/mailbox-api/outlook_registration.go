@@ -54,6 +54,7 @@ type outlookRegistrationRunner struct {
 	cfg           outlookRegistrationConfig
 	browserClient browserautomationv1.BrowserAutomationServiceClient
 	httpClient    *http.Client
+	outlookProxy  *outlookProxyManager
 }
 
 type mailboxRecord struct {
@@ -62,12 +63,17 @@ type mailboxRecord struct {
 	refreshToken string
 	accessToken  string
 	source       string
+	homeCountry  string
+	homeIP       string
+	proxyProfile string
 }
 
 type oauthResult struct {
 	refreshToken string
 	accessToken  string
 }
+
+type outlookRegistrationProgress func(step string)
 
 func loadOutlookRegistrationConfig() outlookRegistrationConfig {
 	locale := envDefault("OUTLOOK_REGISTER_AUTOMATION_LOCALE", "en-US")
@@ -97,10 +103,16 @@ func newOutlookRegistrationRunner(cfg outlookRegistrationConfig, browserClient b
 		cfg:           cfg,
 		browserClient: browserClient,
 		httpClient:    httpClient,
+		outlookProxy:  newOutlookProxyManagerFromEnv(),
 	}
 }
 
 func (r *outlookRegistrationRunner) RunMailboxRegistration(ctx context.Context, req *pb.RunMailboxRegistrationRequest) (*pb.RunMailboxRegistrationResponse, error) {
+	return r.RunMailboxRegistrationWithProgress(ctx, req, nil)
+}
+
+func (r *outlookRegistrationRunner) RunMailboxRegistrationWithProgress(ctx context.Context, req *pb.RunMailboxRegistrationRequest, progress outlookRegistrationProgress) (*pb.RunMailboxRegistrationResponse, error) {
+	progressStep(progress, "registration_check_results")
 	records, err := readMailboxRecords(r.cfg.resultsDir, true)
 	if req.GetImportOnly() {
 		return registrationResponse(records, err), nil
@@ -114,11 +126,223 @@ func (r *outlookRegistrationRunner) RunMailboxRegistration(ctx context.Context, 
 	if !req.GetEnabled() || !envBool("OUTLOOK_REGISTER_ENABLED", false) {
 		return &pb.RunMailboxRegistrationResponse{Success: false, ExitCode: 0, ErrorMessage: "mailbox registration is disabled"}, nil
 	}
-	return &pb.RunMailboxRegistrationResponse{
-		Success:      false,
-		ExitCode:     1,
-		ErrorMessage: "Outlook account creation is modeled in mailbox-api and must execute through browser-automation before enabling this action",
-	}, nil
+
+	count := int(req.GetMaxCount())
+	if count <= 0 {
+		count = envPositiveInt("OUTLOOK_REGISTER_MAX_TASKS", 1)
+	}
+	if count > 5 {
+		count = 5
+	}
+	response := &pb.RunMailboxRegistrationResponse{}
+	for i := 0; i < count; i++ {
+		progressStep(progress, fmt.Sprintf("registration_account_%d_prepare", i+1))
+		record, err := r.registerOutlookAccount(ctx, progress)
+		if err != nil {
+			response.ErrorMessage = appendRegistrationError(response.GetErrorMessage(), err.Error())
+			continue
+		}
+		response.Accounts = append(response.Accounts, &pb.MailboxRegistrationAccount{
+			EmailAddress:           record.email,
+			Password:               record.password,
+			RefreshToken:           record.refreshToken,
+			AccessToken:            record.accessToken,
+			Source:                 record.source,
+			HomeCountry:            record.homeCountry,
+			HomeIp:                 record.homeIP,
+			ProxyProfile:           record.proxyProfile,
+			ManualRecoveryRequired: strings.TrimSpace(record.refreshToken) == "",
+		})
+	}
+	response.Success = len(response.GetAccounts()) > 0
+	if !response.Success {
+		response.ExitCode = 1
+		if response.GetErrorMessage() == "" {
+			response.ErrorMessage = "Outlook registration did not create any account"
+		}
+	}
+	return response, nil
+}
+
+func progressStep(progress outlookRegistrationProgress, step string) {
+	if progress != nil {
+		progress(step)
+	}
+}
+
+func (r *outlookRegistrationRunner) registerOutlookAccount(ctx context.Context, progress outlookRegistrationProgress) (mailboxRecord, error) {
+	emailLocal := generateOutlookEmailLocal()
+	emailSuffix := envDefault("OUTLOOK_REGISTER_EMAIL_SUFFIX", "@outlook.com")
+	if !strings.HasPrefix(emailSuffix, "@") {
+		emailSuffix = "@" + emailSuffix
+	}
+	email := normalizeEmail(emailLocal + strings.ToLower(emailSuffix))
+	password := generateOutlookPassword()
+	homeCountry := strings.ToUpper(strings.TrimSpace(envDefault("OUTLOOK_REGISTER_HOME_COUNTRY", "")))
+	if homeCountry == "" && r.outlookProxy != nil {
+		homeCountry = strings.ToUpper(strings.TrimSpace(r.outlookProxy.region))
+	}
+
+	progressStep(progress, "registration_start_browser")
+	session, proxySession, err := r.startSession(ctx, email, homeCountry, "register", true)
+	if err != nil {
+		return mailboxRecord{}, err
+	}
+	defer r.stopSession(session)
+
+	progressStep(progress, "registration_open_outlook_signup")
+	if _, err := r.execute(ctx, session, "outlook.register.open", []*browserautomationv1.BrowserCommand{
+		navigateCommandWithWait("open-signup", "https://outlook.live.com/mail/0/?prompt=create_account", 45*time.Second, browserautomationv1.BrowserNavigationWaitUntil_BROWSER_NAVIGATION_WAIT_UNTIL_COMMIT),
+	}); err != nil {
+		return mailboxRecord{}, err
+	}
+	progressStep(progress, "registration_signup_page_probe")
+	if _, err := r.execute(ctx, session, "outlook.register.probe", []*browserautomationv1.BrowserCommand{
+		pageStateCommand("signup-page-state", true, 10*time.Second),
+	}); err != nil {
+		return mailboxRecord{}, err
+	}
+	progressStep(progress, "registration_submit_outlook_signup")
+	result, err := r.runOutlookRegisterStepLoop(ctx, session, map[string]any{
+		"email":      email,
+		"emailLocal": emailLocal,
+		"password":   password,
+		"firstName":  generateOutlookFirstName(),
+		"lastName":   generateOutlookLastName(),
+		"birthYear":  fmt.Sprintf("%d", 1970+envPositiveInt("OUTLOOK_REGISTER_BIRTH_YEAR_OFFSET", 22)%30),
+		"birthMonth": fmt.Sprintf("%d", (envPositiveInt("OUTLOOK_REGISTER_BIRTH_MONTH", 1)-1)%12+1),
+		"birthDay":   fmt.Sprintf("%d", (envPositiveInt("OUTLOOK_REGISTER_BIRTH_DAY", 12)-1)%28+1),
+	})
+	if err != nil {
+		return mailboxRecord{}, err
+	}
+	state := stringMapValue(result, "state")
+	if state != "registered" && state != "mailbox_opened" {
+		detail := stringMapValue(result, "message")
+		if detail == "" {
+			detail = stringMapValue(result, "url")
+		}
+		if detail == "" {
+			detail = "unknown registration state"
+		}
+		return mailboxRecord{}, fmt.Errorf("Outlook registration failed: %s %s", state, detail)
+	}
+
+	record := mailboxRecord{
+		email:        email,
+		password:     password,
+		source:       "browser_automation",
+		homeCountry:  homeCountry,
+		proxyProfile: proxySession,
+	}
+	if envBool("OUTLOOK_REGISTER_ENABLE_OAUTH2", true) {
+		progressStep(progress, "registration_oauth")
+		tokens, err := r.runBrowserOAuth(ctx, email, password, homeCountry, true)
+		if err != nil {
+			record.source = "browser_automation_oauth_pending"
+			return record, nil
+		}
+		record.refreshToken = tokens.refreshToken
+		record.accessToken = tokens.accessToken
+	}
+	progressStep(progress, "registration_account_ready")
+	return record, nil
+}
+
+func (r *outlookRegistrationRunner) runOutlookRegisterStepLoop(ctx context.Context, session string, args map[string]any) (map[string]any, error) {
+	attempts := envPositiveInt("OUTLOOK_REGISTER_STEP_ATTEMPTS", 150)
+	if attempts > 300 {
+		attempts = 300
+	}
+	var last map[string]any
+	for i := 0; i < attempts; i++ {
+		results, err := r.execute(ctx, session, "outlook.register.submit", []*browserautomationv1.BrowserCommand{
+			evaluateCommand("create-outlook-account", outlookRegisterScript, args, 8*time.Second),
+		})
+		if err != nil {
+			return last, err
+		}
+		result := commandResultMap(results, "create-outlook-account")
+		if result != nil {
+			last = result
+		}
+		state := stringMapValue(result, "state")
+		switch state {
+		case "registered", "mailbox_opened", "needs_manual_verification", "rate_limited":
+			return result, nil
+		case "captcha_required":
+			if err := r.solveOutlookCaptcha(ctx, session); err != nil {
+				return result, err
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
+	}
+	if last == nil {
+		last = map[string]any{"state": "timeout", "message": "Outlook registration did not return page state"}
+	} else {
+		last["state"] = "timeout"
+	}
+	return last, nil
+}
+
+func (r *outlookRegistrationRunner) solveOutlookCaptcha(ctx context.Context, session string) error {
+	attempts := envPositiveInt("OUTLOOK_REGISTER_CAPTCHA_ATTEMPTS", 3)
+	if attempts > 5 {
+		attempts = 5
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		results, err := r.execute(ctx, session, "outlook.register.captcha", []*browserautomationv1.BrowserCommand{
+			clickCommand("press-and-hold-captcha", []*browserautomationv1.BrowserSelector{
+				cssSelector("[aria-label*='Press and hold' i]"),
+				cssSelector("[aria-label*='Press' i]"),
+				cssSelector("button:has-text('Press and hold')"),
+				cssSelector("button:has-text('Press')"),
+				textSelector("Press and hold"),
+				textSelector("Press again"),
+			}, 5*time.Second, 6500*time.Millisecond),
+			evaluateCommand("captcha-after-wait", `async () => {
+				await new Promise((resolve) => setTimeout(resolve, 8000));
+				const text = document.body ? document.body.innerText || "" : "";
+				return {url: location.href, text: text.slice(0, 500)};
+			}`, nil, 12*time.Second),
+		})
+		if err != nil {
+			lastErr = err
+		} else {
+			state := commandResultMap(results, "captcha-after-wait")
+			text := stringMapValue(state, "text")
+			if !strings.Contains(strings.ToLower(text), "press and hold") && !strings.Contains(strings.ToLower(text), "prove you're human") {
+				return nil
+			}
+			lastErr = errors.New("captcha press-and-hold did not clear challenge")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("captcha press-and-hold did not complete")
+	}
+	return lastErr
+}
+
+func appendRegistrationError(existing string, next string) string {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return existing
+	}
+	if strings.TrimSpace(existing) == "" {
+		return next
+	}
+	return existing + "; " + next
 }
 
 func (r *outlookRegistrationRunner) RunMailboxOAuth(ctx context.Context, req *pb.RunMailboxOAuthRequest) (*pb.RunMailboxOAuthResponse, error) {
@@ -140,7 +364,7 @@ func (r *outlookRegistrationRunner) RunMailboxOAuth(ctx context.Context, req *pb
 			response.Results = append(response.Results, result)
 			continue
 		}
-		tokens, err := r.runBrowserOAuth(ctx, account.GetEmailAddress(), account.GetPassword())
+		tokens, err := r.runBrowserOAuth(ctx, account.GetEmailAddress(), account.GetPassword(), account.GetHomeCountry(), account.GetManualRecoveryRequired())
 		if err != nil {
 			result.ErrorMessage = err.Error()
 			response.Failed++
@@ -160,8 +384,8 @@ func (r *outlookRegistrationRunner) RunMailboxOAuth(ctx context.Context, req *pb
 	return response, nil
 }
 
-func (r *outlookRegistrationRunner) runBrowserOAuth(ctx context.Context, email string, password string) (oauthResult, error) {
-	session, err := r.startSession(ctx, email)
+func (r *outlookRegistrationRunner) runBrowserOAuth(ctx context.Context, email string, password string, homeCountry string, reuseCurrentProxy bool) (oauthResult, error) {
+	session, _, err := r.startSession(ctx, email, homeCountry, "oauth", !reuseCurrentProxy)
 	if err != nil {
 		return oauthResult{}, err
 	}
@@ -193,17 +417,102 @@ func (r *outlookRegistrationRunner) runBrowserOAuth(ctx context.Context, email s
 	if code == "" {
 		return oauthResult{}, fmt.Errorf("OAuth code not found in redirect URL: %s", sanitizeURL(resultURL))
 	}
-	return r.exchangeOAuthCode(ctx, code)
+	return r.exchangeOAuthCode(ctx, code, r.httpClientForCurrentProxy())
 }
 
-func (r *outlookRegistrationRunner) startSession(ctx context.Context, email string) (string, error) {
+type outlookManualRecoverySession struct {
+	email         string
+	sessionID     string
+	proxyCountry  string
+	proxySession  string
+	localProxyURL string
+	recoveryURL   string
+	launchCommand string
+	instruction   string
+}
+
+func (r *outlookRegistrationRunner) StartManualRecovery(ctx context.Context, mailbox *pb.EmailMailbox) (outlookManualRecoverySession, error) {
+	if mailbox == nil || normalizeEmail(mailbox.GetEmailAddress()) == "" {
+		return outlookManualRecoverySession{}, errors.New("mailbox email_address is required")
+	}
+	sessionID, proxySession, err := r.startSession(ctx, mailbox.GetEmailAddress(), mailbox.GetHomeCountry(), "manual_recovery", true)
+	if err != nil {
+		return outlookManualRecoverySession{}, err
+	}
+	_, err = r.execute(ctx, sessionID, "outlook.manual_recovery", []*browserautomationv1.BrowserCommand{
+		navigateCommand("open-login", "https://login.live.com/", r.cfg.commandTimeout),
+	})
+	if err != nil {
+		return outlookManualRecoverySession{}, err
+	}
+	return outlookManualRecoverySession{
+		email:        normalizeEmail(mailbox.GetEmailAddress()),
+		sessionID:    sessionID,
+		proxyCountry: strings.ToUpper(strings.TrimSpace(mailbox.GetHomeCountry())),
+		proxySession: proxySession,
+	}, nil
+}
+
+func (r *outlookRegistrationRunner) PrepareLocalManualRecovery(ctx context.Context, mailbox *pb.EmailMailbox) (outlookManualRecoverySession, error) {
+	if mailbox == nil || normalizeEmail(mailbox.GetEmailAddress()) == "" {
+		return outlookManualRecoverySession{}, errors.New("mailbox email_address is required")
+	}
+	if r.outlookProxy == nil || !r.outlookProxy.enabled() {
+		return outlookManualRecoverySession{}, errors.New("Outlook proxy is not configured")
+	}
+	email := normalizeEmail(mailbox.GetEmailAddress())
+	country := strings.ToUpper(strings.TrimSpace(mailbox.GetHomeCountry()))
+	proxySession, err := r.outlookProxy.rotateSession(ctx, email, country)
+	if err != nil {
+		return outlookManualRecoverySession{}, err
+	}
+	localProxyURL := localManualRecoveryProxyURL()
+	recoveryURL := "https://login.live.com/"
+	command := localManualRecoveryLaunchCommand(email, localProxyURL, recoveryURL)
+	return outlookManualRecoverySession{
+		email:         email,
+		sessionID:     "local-visible-browser",
+		proxyCountry:  country,
+		proxySession:  proxySession,
+		localProxyURL: localProxyURL,
+		recoveryURL:   recoveryURL,
+		launchCommand: command,
+		instruction:   "Run the launch command on this Windows client and complete Microsoft verification in the dedicated browser. Do not refresh the Sticky session or change the outbound IP during recovery.",
+	}, nil
+}
+
+func (r *outlookRegistrationRunner) startSession(ctx context.Context, email string, homeCountry string, workflow string, rotateProxy bool) (string, string, error) {
 	if r.browserClient == nil {
-		return "", errors.New("browser-automation client is not initialized")
+		return "", "", errors.New("browser-automation client is not initialized")
+	}
+	proxySession := ""
+	if rotateProxy && r.outlookProxy != nil && r.outlookProxy.enabled() {
+		hash, err := r.outlookProxy.rotateSession(ctx, email, homeCountry)
+		if err != nil {
+			return "", "", err
+		}
+		proxySession = hash
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, r.cfg.commandTimeout)
 	defer cancel()
+	if workflow == "" {
+		workflow = "oauth"
+	}
+	labels := map[string]string{
+		"domain":        "mailbox",
+		"provider":      "outlook",
+		"workflow":      workflow,
+		"email_hash":    hashLabel(email),
+		"home_country":  strings.ToUpper(strings.TrimSpace(homeCountry)),
+		"proxy_session": proxySession,
+	}
+	if workflow == "register" && envBool("OUTLOOK_REGISTER_BLOCK_BROWSER_RESOURCES", true) {
+		labels["camoufox.block_resources"] = "true"
+		labels["camoufox.block_resource_types"] = envDefault("OUTLOOK_REGISTER_BLOCK_RESOURCE_TYPES", "image,font,media")
+		labels["camoufox.block_url_patterns"] = envDefault("OUTLOOK_REGISTER_BLOCK_URL_PATTERNS", "gvt1.com,edgedl.me.gvt1.com,google-analytics.com,googletagmanager.com,clarity.ms,bat.bing.com,events.data.microsoft.com,arc.msn.com,collector.azure.com")
+	}
 	resp, err := r.browserClient.StartBrowserSession(reqCtx, &browserautomationv1.StartBrowserSessionRequest{
-		RequestId: "outlook-oauth-" + uuid.NewString(),
+		RequestId: "outlook-" + workflow + "-" + uuid.NewString(),
 		Profile: &browserautomationv1.BrowserProfile{
 			BrowserKind: browserautomationv1.BrowserKind_BROWSER_KIND_FIREFOX,
 			Locale:      r.cfg.locale,
@@ -217,26 +526,21 @@ func (r *outlookRegistrationRunner) startSession(ctx context.Context, email stri
 			ExtraHttpHeaders: map[string]string{
 				"Accept-Language": r.cfg.acceptLanguage,
 			},
-			Labels: map[string]string{
-				"domain":     "mailbox",
-				"provider":   "outlook",
-				"workflow":   "oauth",
-				"email_hash": hashLabel(email),
-			},
+			Labels: labels,
 		},
 		Ttl: durationpb.New(r.cfg.sessionTTL),
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if resp.GetError() != nil {
-		return "", errors.New(resp.GetError().GetMessage())
+		return "", "", errors.New(resp.GetError().GetMessage())
 	}
 	sessionID := resp.GetSession().GetSessionId()
 	if sessionID == "" {
-		return "", errors.New("browser-automation returned empty session_id")
+		return "", "", errors.New("browser-automation returned empty session_id")
 	}
-	return sessionID, nil
+	return sessionID, proxySession, nil
 }
 
 func (r *outlookRegistrationRunner) stopSession(sessionID string) {
@@ -252,7 +556,7 @@ func (r *outlookRegistrationRunner) stopSession(sessionID string) {
 }
 
 func (r *outlookRegistrationRunner) execute(ctx context.Context, sessionID string, taskKey string, commands []*browserautomationv1.BrowserCommand) ([]*browserautomationv1.BrowserCommandResult, error) {
-	timeout := r.cfg.commandTimeout + 15*time.Second
+	timeout := browserCommandsTimeout(commands, r.cfg.commandTimeout) + 15*time.Second
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	resp, err := r.browserClient.ExecuteBrowserCommands(reqCtx, &browserautomationv1.ExecuteBrowserCommandsRequest{
@@ -288,6 +592,22 @@ func (r *outlookRegistrationRunner) execute(ctx context.Context, sessionID strin
 	return resp.GetResults(), nil
 }
 
+func browserCommandsTimeout(commands []*browserautomationv1.BrowserCommand, fallback time.Duration) time.Duration {
+	maxTimeout := time.Duration(0)
+	for _, command := range commands {
+		if command == nil || command.GetTimeout() == nil {
+			continue
+		}
+		if value := command.GetTimeout().AsDuration(); value > maxTimeout {
+			maxTimeout = value
+		}
+	}
+	if maxTimeout <= 0 {
+		maxTimeout = fallback
+	}
+	return maxTimeout
+}
+
 func (r *outlookRegistrationRunner) oauthAuthorizeURL(state string) string {
 	values := url.Values{}
 	values.Set("client_id", r.cfg.oauthClientID)
@@ -300,7 +620,18 @@ func (r *outlookRegistrationRunner) oauthAuthorizeURL(state string) string {
 	return defaultOutlookOAuthAuthorizeURL + "?" + values.Encode()
 }
 
-func (r *outlookRegistrationRunner) exchangeOAuthCode(ctx context.Context, code string) (oauthResult, error) {
+func (r *outlookRegistrationRunner) httpClientForCurrentProxy() *http.Client {
+	if r.outlookProxy == nil || !r.outlookProxy.enabled() || strings.TrimSpace(r.outlookProxy.proxyURL) == "" {
+		return r.httpClient
+	}
+	client, err := httpClientForProxyURL(r.outlookProxy.proxyURL, r.outlookProxy.timeout)
+	if err != nil {
+		return r.httpClient
+	}
+	return client
+}
+
+func (r *outlookRegistrationRunner) exchangeOAuthCode(ctx context.Context, code string, httpClient *http.Client) (oauthResult, error) {
 	values := url.Values{}
 	values.Set("client_id", r.cfg.oauthClientID)
 	values.Set("scope", strings.Join(r.cfg.oauthScopes, " "))
@@ -313,7 +644,10 @@ func (r *outlookRegistrationRunner) exchangeOAuthCode(ctx context.Context, code 
 		return oauthResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := r.httpClient.Do(req)
+	if httpClient == nil {
+		httpClient = r.httpClient
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return oauthResult{}, err
 	}
@@ -345,6 +679,9 @@ func registrationResponse(records []mailboxRecord, err error) *pb.RunMailboxRegi
 			RefreshToken: record.refreshToken,
 			AccessToken:  record.accessToken,
 			Source:       record.source,
+			HomeCountry:  record.homeCountry,
+			HomeIp:       record.homeIP,
+			ProxyProfile: record.proxyProfile,
 		})
 	}
 	errorMessage := ""
@@ -378,11 +715,15 @@ func selectOAuthTargets(req *pb.RunMailboxOAuthRequest) []*pb.MailboxRegistratio
 			continue
 		}
 		targets = append(targets, &pb.MailboxRegistrationAccount{
-			EmailAddress: email,
-			Password:     strings.TrimSpace(account.GetPassword()),
-			RefreshToken: strings.TrimSpace(account.GetRefreshToken()),
-			AccessToken:  strings.TrimSpace(account.GetAccessToken()),
-			Source:       strings.TrimSpace(account.GetSource()),
+			EmailAddress:           email,
+			Password:               strings.TrimSpace(account.GetPassword()),
+			RefreshToken:           strings.TrimSpace(account.GetRefreshToken()),
+			AccessToken:            strings.TrimSpace(account.GetAccessToken()),
+			Source:                 strings.TrimSpace(account.GetSource()),
+			HomeCountry:            strings.ToUpper(strings.TrimSpace(account.GetHomeCountry())),
+			HomeIp:                 strings.TrimSpace(account.GetHomeIp()),
+			ProxyProfile:           strings.TrimSpace(account.GetProxyProfile()),
+			ManualRecoveryRequired: account.GetManualRecoveryRequired(),
 		})
 		if requested == "" && int32(len(targets)) >= limit {
 			break
@@ -479,6 +820,10 @@ func parsePasswordFile(path string) ([]mailboxRecord, error) {
 }
 
 func navigateCommand(commandID, targetURL string, timeout time.Duration) *browserautomationv1.BrowserCommand {
+	return navigateCommandWithWait(commandID, targetURL, timeout, browserautomationv1.BrowserNavigationWaitUntil_BROWSER_NAVIGATION_WAIT_UNTIL_DOM_CONTENT_LOADED)
+}
+
+func navigateCommandWithWait(commandID, targetURL string, timeout time.Duration, waitUntil browserautomationv1.BrowserNavigationWaitUntil) *browserautomationv1.BrowserCommand {
 	return &browserautomationv1.BrowserCommand{
 		CommandId:  commandID,
 		CommandKey: commandID,
@@ -486,8 +831,22 @@ func navigateCommand(commandID, targetURL string, timeout time.Duration) *browse
 		Operation: &browserautomationv1.BrowserCommand_Navigate{
 			Navigate: &browserautomationv1.NavigateCommand{
 				Url:       targetURL,
-				WaitUntil: browserautomationv1.BrowserNavigationWaitUntil_BROWSER_NAVIGATION_WAIT_UNTIL_DOM_CONTENT_LOADED,
+				WaitUntil: waitUntil,
 				Timeout:   durationpb.New(timeout),
+			},
+		},
+	}
+}
+
+func pageStateCommand(commandID string, includeText bool, timeout time.Duration) *browserautomationv1.BrowserCommand {
+	return &browserautomationv1.BrowserCommand{
+		CommandId:  commandID,
+		CommandKey: commandID,
+		Timeout:    durationpb.New(timeout),
+		Operation: &browserautomationv1.BrowserCommand_GetPageState{
+			GetPageState: &browserautomationv1.GetPageStateCommand{
+				IncludeTitle: true,
+				IncludeText:  includeText,
 			},
 		},
 	}
@@ -507,6 +866,40 @@ func evaluateCommand(commandID, expression string, args map[string]any, timeout 
 				Expression: expression,
 				Args:       structArgs,
 				Timeout:    durationpb.New(timeout),
+			},
+		},
+	}
+}
+
+func cssSelector(value string) *browserautomationv1.BrowserSelector {
+	return &browserautomationv1.BrowserSelector{
+		Kind:  browserautomationv1.BrowserSelectorKind_BROWSER_SELECTOR_KIND_CSS,
+		Value: value,
+	}
+}
+
+func textSelector(value string) *browserautomationv1.BrowserSelector {
+	return &browserautomationv1.BrowserSelector{
+		Kind:  browserautomationv1.BrowserSelectorKind_BROWSER_SELECTOR_KIND_TEXT,
+		Value: value,
+	}
+}
+
+func clickCommand(commandID string, selectors []*browserautomationv1.BrowserSelector, timeout time.Duration, hold time.Duration) *browserautomationv1.BrowserCommand {
+	return &browserautomationv1.BrowserCommand{
+		CommandId:  commandID,
+		CommandKey: commandID,
+		Timeout:    durationpb.New(timeout + hold + 2*time.Second),
+		Operation: &browserautomationv1.BrowserCommand_Click{
+			Click: &browserautomationv1.ClickCommand{
+				SelectorGroup: &browserautomationv1.BrowserSelectorGroup{
+					Selectors: selectors,
+					Timeout:   durationpb.New(timeout),
+				},
+				Force:        true,
+				Button:       browserautomationv1.BrowserMouseButton_BROWSER_MOUSE_BUTTON_LEFT,
+				HoldDuration: durationpb.New(hold),
+				Timeout:      durationpb.New(timeout),
 			},
 		},
 	}
@@ -546,6 +939,38 @@ func splitScopes(value string) []string {
 		return strings.Fields(defaultOutlookOAuthScopes)
 	}
 	return parts
+}
+
+func generateOutlookEmailLocal() string {
+	first := strings.ToLower(generateOutlookFirstName())
+	last := strings.ToLower(generateOutlookLastName())
+	suffix, err := randomHex(3)
+	if err != nil {
+		suffix = shortValueHash(fmt.Sprintf("%d", time.Now().UnixNano()))[:6]
+	}
+	local := first + last + suffix
+	if len(local) > 24 {
+		local = local[:24]
+	}
+	return local
+}
+
+func generateOutlookPassword() string {
+	raw, err := randomHex(6)
+	if err != nil {
+		raw = shortValueHash(fmt.Sprintf("%d", time.Now().UnixNano()))
+	}
+	return "M." + raw[:6] + "_" + raw[6:] + "!Q7"
+}
+
+func generateOutlookFirstName() string {
+	names := []string{"James", "Robert", "John", "Michael", "David", "William", "Richard", "Thomas", "Daniel", "Andrew", "Jessica", "Ashley", "Emily", "Sarah", "Amanda", "Nicole"}
+	return names[time.Now().Nanosecond()%len(names)]
+}
+
+func generateOutlookLastName() string {
+	names := []string{"Smith", "Johnson", "Brown", "Taylor", "Anderson", "Thomas", "Moore", "Martin", "Jackson", "White", "Harris", "Clark", "Lewis", "Walker", "Young", "King"}
+	return names[(time.Now().Nanosecond()/1000)%len(names)]
 }
 
 func acceptLanguage(locale string) string {
@@ -660,4 +1085,203 @@ const outlookOAuthScript = `async ({email, password}) => {
     await sleep(1000);
   }
   return {state: "timeout", url: location.href};
+}`
+
+const outlookRegisterScript = `async ({email, emailLocal, password, firstName, lastName, birthYear, birthMonth, birthDay}) => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const textOf = (el) => (el?.innerText || el?.textContent || el?.value || "").trim();
+  const fill = (el, value) => {
+    el.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    if (setter) setter.call(el, value); else el.value = value;
+    el.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: value}));
+    el.dispatchEvent(new Event("change", {bubbles: true}));
+  };
+  const click = (el) => {
+    el.scrollIntoView({block: "center", inline: "center"});
+    el.click();
+  };
+  const clickByText = (pattern) => {
+    for (const el of document.querySelectorAll("button,input[type=submit],a,div[role=button],span[role=button]")) {
+      if (!el.disabled && visible(el) && pattern.test(textOf(el))) {
+        click(el);
+        return true;
+      }
+    }
+    return false;
+  };
+  const firstVisible = (selectors) => {
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (visible(el)) return el;
+      }
+    }
+    return null;
+  };
+  const selectValue = (selectors, value, labels = []) => {
+    const el = firstVisible(selectors);
+    if (!el) return false;
+    const wanted = [value, String(value).padStart(2, "0"), ...labels].map((item) => String(item).trim().toLowerCase()).filter(Boolean);
+    const option = Array.from(el.options || []).find((item) => {
+      const candidates = [item.value, item.textContent, item.label].map((part) => String(part || "").trim().toLowerCase());
+      return candidates.some((candidate) => wanted.includes(candidate));
+    });
+    el.value = option ? option.value : value;
+    el.dispatchEvent(new Event("input", {bubbles: true}));
+    el.dispatchEvent(new Event("change", {bubbles: true}));
+    return true;
+  };
+  const controlText = (el) => [
+    textOf(el),
+    el.getAttribute?.("aria-label"),
+    el.getAttribute?.("placeholder"),
+    el.getAttribute?.("name"),
+    el.getAttribute?.("id"),
+    el.getAttribute?.("title")
+  ].filter(Boolean).join(" ");
+  const findControl = (patterns) => {
+    for (const el of document.querySelectorAll("input,select,button,[role='button'],[role='combobox']")) {
+      if (visible(el) && patterns.some((pattern) => pattern.test(controlText(el)))) return el;
+    }
+    return null;
+  };
+  const clickOption = async (values) => {
+    const wanted = values.map((value) => String(value).trim().toLowerCase()).filter(Boolean);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const options = Array.from(document.querySelectorAll("[role='option'],option,li,button,div,span")).filter(visible);
+      const option = options.find((el) => wanted.includes(textOf(el).trim().toLowerCase()));
+      if (option) {
+        click(option);
+        await sleep(350);
+        return true;
+      }
+      await sleep(150);
+    }
+    return false;
+  };
+  const setComboValue = async (patterns, values) => {
+    const el = findControl(patterns);
+    if (!el) return false;
+    if (el.tagName === "SELECT") {
+      const wanted = values.map((item) => String(item).trim().toLowerCase()).filter(Boolean);
+      const option = Array.from(el.options || []).find((item) => [item.value, item.textContent, item.label].some((part) => wanted.includes(String(part || "").trim().toLowerCase())));
+      el.value = option ? option.value : values[0];
+      el.dispatchEvent(new Event("input", {bubbles: true}));
+      el.dispatchEvent(new Event("change", {bubbles: true}));
+      return true;
+    }
+    click(el);
+    await sleep(350);
+    return await clickOption(values);
+  };
+  const diagnostics = () => ({
+    controls: Array.from(document.querySelectorAll("input,select,button,[role='button'],[role='combobox']")).filter(visible).slice(0, 30).map((el) => ({
+      tag: el.tagName,
+      type: el.getAttribute("type") || "",
+      name: el.getAttribute("name") || "",
+      id: el.id || "",
+      aria: el.getAttribute("aria-label") || "",
+      role: el.getAttribute("role") || "",
+      text: textOf(el).slice(0, 80),
+      value: el.value || ""
+    }))
+  });
+  const bodyText = () => document.body ? document.body.innerText || "" : "";
+  const current = () => ({url: location.href, text: bodyText()});
+  const hasCaptcha = () => {
+    const text = bodyText();
+    return document.querySelector("iframe#enforcementFrame,[src*='arkoselabs'],[src*='funcaptcha'],[class*='captcha' i]") ||
+      /captcha|challenge|press and hold|prove.*human|help us beat the robots|verify.*human/i.test(text);
+  };
+  const hasRateLimit = () => /unusual activity|temporarily blocked|try again later|too many attempts|service unavailable/i.test(bodyText());
+
+  for (let i = 0; i < 1; i++) {
+    const state = current();
+    if (/outlook\.live\.com\/mail|mail\.live\.com/i.test(state.url) && /inbox|focused|other|new mail|outlook/i.test(state.text)) {
+      return {state: "mailbox_opened", url: state.url};
+    }
+    if (/account\.live\.com\/abuse|identity|proof|recover|Add security info/i.test(state.url) || /help us protect|verify your identity|add security info|security info/i.test(state.text)) {
+      return {state: "needs_manual_verification", url: state.url, message: "Microsoft requested extra verification"};
+    }
+    if (hasRateLimit()) return {state: "rate_limited", url: state.url, message: "Microsoft returned rate limit or unusual activity"};
+    if (hasCaptcha()) return {state: "captcha_required", url: state.url, message: "CAPTCHA or press-and-hold challenge detected"};
+
+    const consent = Array.from(document.querySelectorAll("button,input[type=submit]")).find((el) => visible(el) && /agree|accept|continue/i.test(textOf(el)));
+    if (consent) {
+      click(consent);
+      await sleep(1200);
+      continue;
+    }
+
+    const emailInput = firstVisible([
+      "input[name='MemberName']",
+      "input#MemberName",
+      "input[type='email']",
+      "input[name='loginfmt']",
+      "input[aria-label*='email' i]",
+      "input[placeholder*='email' i]",
+      "input[type='text']"
+    ]);
+    if (emailInput && !/password|passwd|first|last|birth/i.test(emailInput.name || "")) {
+      const signupText = bodyText();
+      const value = /@outlook\.com|@hotmail\.com|new email/i.test(signupText) ? emailLocal : email;
+      fill(emailInput, value);
+      await sleep(400);
+      clickByText(/^(next|continue|下一步|继续)$/i) || clickByText(/create|sign up/i);
+      await sleep(1500);
+      continue;
+    }
+
+    const passwordInput = firstVisible(["input[type='password']", "input[name='Password']", "input[name='passwd']"]);
+    if (passwordInput) {
+      fill(passwordInput, password);
+      await sleep(400);
+      clickByText(/^(next|continue|下一步|继续)$/i);
+      await sleep(1500);
+      continue;
+    }
+
+    const firstInput = firstVisible(["input#firstNameInput", "input[name='FirstName']", "input[aria-label*='first' i]"]);
+    const lastInput = firstVisible(["input#lastNameInput", "input[name='LastName']", "input[aria-label*='last' i]"]);
+    if (firstInput || lastInput) {
+      if (firstInput) fill(firstInput, firstName);
+      if (lastInput) fill(lastInput, lastName);
+      await sleep(400);
+      clickByText(/^(next|continue|下一步|继续)$/i);
+      await sleep(1500);
+      continue;
+    }
+
+    const monthLabels = [["January", "Jan"], ["February", "Feb"], ["March", "Mar"], ["April", "Apr"], ["May"], ["June", "Jun"], ["July", "Jul"], ["August", "Aug"], ["September", "Sep"], ["October", "Oct"], ["November", "Nov"], ["December", "Dec"]];
+    const monthIndex = Math.max(1, Math.min(12, Number(birthMonth) || 1));
+    const monthValues = [birthMonth, String(monthIndex), String(monthIndex).padStart(2, "0"), ...monthLabels[monthIndex - 1]];
+    const dayValues = [birthDay, String(Number(birthDay) || 12), String(Number(birthDay) || 12).padStart(2, "0")];
+    const yearInput = firstVisible(["input[name='BirthYear']", "input#BirthYear", "input[aria-label*='year' i]", "input[placeholder*='year' i]"]);
+    const hasBirthControl = document.querySelector("select[name='BirthMonth'],select[name='BirthDay'],select[aria-label*='month' i],select[aria-label*='day' i],[role='combobox'],button");
+    if (yearInput || hasBirthControl || /birthdate|birth date|date of birth|Month\s+Day\s+Year/i.test(state.text)) {
+      selectValue(["select[name='BirthMonth']", "select#BirthMonth", "select[aria-label*='month' i]"], birthMonth, monthValues);
+      selectValue(["select[name='BirthDay']", "select#BirthDay", "select[aria-label*='day' i]"], birthDay, dayValues);
+      await setComboValue([/month/i], monthValues);
+      await setComboValue([/day/i], dayValues);
+      if (yearInput) fill(yearInput, birthYear);
+      await sleep(500);
+      clickByText(/^(next|continue|下一步|继续)$/i);
+      await sleep(1600);
+      continue;
+    }
+
+    if (clickByText(/^(yes|no|skip|next|continue|accept|not now|以后再说|跳过|下一步|继续)$/i)) {
+      await sleep(1400);
+      continue;
+    }
+
+    await sleep(1000);
+  }
+  return {state: "timeout", url: location.href, message: bodyText().slice(0, 300), diagnostics: diagnostics()};
 }`

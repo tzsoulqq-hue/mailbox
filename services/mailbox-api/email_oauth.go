@@ -25,6 +25,10 @@ type OAuthManager struct {
 }
 
 func NewOAuthManager(refreshToken string) *OAuthManager {
+	return NewOAuthManagerWithClient(refreshToken, nil)
+}
+
+func NewOAuthManagerWithClient(refreshToken string, httpClient *http.Client) *OAuthManager {
 	timeout := envInt("OUTLOOK_HTTP_TIMEOUT_SECONDS", defaultHTTPTimeoutSeconds)
 	if timeout <= 0 {
 		timeout = defaultHTTPTimeoutSeconds
@@ -33,12 +37,15 @@ func NewOAuthManager(refreshToken string) *OAuthManager {
 	if scope == "" {
 		scope = defaultOAuthScope
 	}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: time.Duration(timeout) * time.Second}
+	}
 	return &OAuthManager{
 		refreshToken: strings.TrimSpace(refreshToken),
 		clientID:     envStr("OUTLOOK_OAUTH_CLIENT_ID", defaultOAuthClientID),
 		scope:        scope,
 		tokenURL:     envStr("OUTLOOK_OAUTH_TOKEN_URL", defaultTokenURL),
-		httpClient:   &http.Client{Timeout: time.Duration(timeout) * time.Second},
+		httpClient:   httpClient,
 	}
 }
 

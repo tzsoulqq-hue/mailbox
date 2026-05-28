@@ -24,6 +24,9 @@ type FormState = {
   password: string;
   refresh_token: string;
   access_token: string;
+  home_country: string;
+  home_ip: string;
+  proxy_profile: string;
 };
 type ImportMode = 'single' | 'batch';
 const importModeOptions = [
@@ -41,7 +44,7 @@ export function MailboxImportSheet({ open, provider, busy, onOpenChange, onDone,
 }) {
   const [mode, setMode] = useState<ImportMode>('single');
   const [working, setWorking] = useState(false);
-  const singleForm = useForm<FormState>({ defaultValues: { email: '', password: '', refresh_token: '', access_token: '' } });
+  const singleForm = useForm<FormState>({ defaultValues: { email: '', password: '', refresh_token: '', access_token: '', home_country: '', home_ip: '', proxy_profile: '' } });
   const batchForm = useForm<{ batchText: string }>({ defaultValues: { batchText: '' } });
   const importConfig = mailboxProviderConfig(provider).import;
   const singleEmail = singleForm.watch('email');
@@ -63,13 +66,16 @@ export function MailboxImportSheet({ open, provider, busy, onOpenChange, onDone,
     disabled: busy || working || (mode === 'single' ? !singleEmail.trim() : !batchText.trim()),
   }];
 
-  function payload(email: string, password: string, values = singleForm.getValues()) {
+  function payload(email: string, password: string, values: Partial<FormState> = singleForm.getValues()) {
     return {
       email,
       provider,
       password: credentialFields.includes('password') ? password : '',
-      refresh_token: credentialFields.includes('refresh_token') ? values.refresh_token : '',
-      access_token: credentialFields.includes('access_token') ? values.access_token : '',
+      refresh_token: credentialFields.includes('refresh_token') ? values.refresh_token || '' : '',
+      access_token: credentialFields.includes('access_token') ? values.access_token || '' : '',
+      home_country: values.home_country || '',
+      home_ip: values.home_ip || '',
+      proxy_profile: values.proxy_profile || '',
       auth_status: ''
     };
   }
@@ -78,7 +84,7 @@ export function MailboxImportSheet({ open, provider, busy, onOpenChange, onDone,
     setWorking(true);
     try {
       const resp = await api<Mailbox>('/api/mailboxes', { method: 'POST', body: JSON.stringify(payload(values.email, values.password, values)) });
-      singleForm.reset({ email: '', password: '', refresh_token: '', access_token: '' });
+      singleForm.reset({ email: '', password: '', refresh_token: '', access_token: '', home_country: '', home_ip: '', proxy_profile: '' });
       onDone(`邮箱已入池: ${resp.email_address}`);
     } catch (err) {
       onError(errorText(err));
@@ -99,7 +105,7 @@ export function MailboxImportSheet({ open, provider, busy, onOpenChange, onDone,
     try {
       for (const item of batch.items) {
         try {
-          await api<Mailbox>('/api/mailboxes', { method: 'POST', body: JSON.stringify(payload(item.email, item.password)) });
+          await api<Mailbox>('/api/mailboxes', { method: 'POST', body: JSON.stringify(payload(item.email, item.password, item)) });
           success += 1;
         } catch (err) {
           failures.push(`${item.email}: ${errorText(err)}`);
@@ -182,6 +188,24 @@ function SingleMailboxForm({ formId, control, fields: credentialFields, onSubmit
     type: 'password',
     inputId: 'mailbox-import-access-token',
     visible: credentialFields.includes('access_token'),
+  }, {
+    id: 'home-country',
+    name: 'home_country',
+    label: 'Home country',
+    placeholder: 'HK / JP / DE',
+    inputId: 'mailbox-import-home-country',
+  }, {
+    id: 'home-ip',
+    name: 'home_ip',
+    label: 'Home IP',
+    placeholder: 'Original registration IP',
+    inputId: 'mailbox-import-home-ip',
+  }, {
+    id: 'proxy-profile',
+    name: 'proxy_profile',
+    label: 'Proxy profile',
+    placeholder: 'outlook',
+    inputId: 'mailbox-import-proxy-profile',
   }];
 
   return (

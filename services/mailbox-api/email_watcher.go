@@ -31,6 +31,7 @@ type MailWatcher struct {
 	pollInterval int
 	inboxOverlap int
 	httpClient   *http.Client
+	outlookProxy *outlookProxyManager
 	outbound     *mailboxEventDispatcher
 	events       *mailboxEmailEventBus
 
@@ -87,6 +88,7 @@ func NewMailWatcher(store *MailboxStore, events *mailboxEmailEventBus) *MailWatc
 		pollInterval:  pollInterval,
 		inboxOverlap:  inboxOverlap,
 		httpClient:    &http.Client{Timeout: time.Duration(timeout) * time.Second},
+		outlookProxy:  newOutlookProxyManagerFromEnv(),
 		outbound:      newMailboxEventDispatcherFromEnv(),
 		events:        events,
 		oauthManagers: map[string]oauthEntry{},
@@ -147,21 +149,31 @@ func (w *MailWatcher) DispatchMailboxEvents(messages []*pb.EmailInboxMessage) {
 }
 
 func (w *MailWatcher) fetchMailboxMessages(ctx context.Context, mailbox *pb.EmailMailbox, limit int, receivedAfterNs int64) ([]graphMessage, error) {
-	manager := w.oauthManagerForMailbox(mailbox)
+	httpClient, proxySession, err := w.httpClientForMailbox(ctx, mailbox)
+	if err != nil {
+		w.markMailboxAuthError(ctx, mailbox.GetEmailAddress(), err)
+		return nil, err
+	}
+	if proxySession != "" {
+		if err := w.store.UpdateOutlookProxyUse(ctx, mailbox.GetEmailAddress(), mailbox.GetHomeCountry(), proxySession, ""); err != nil {
+			logWarning("failed to update Outlook proxy state for %s: %v", redactEmail(mailbox.GetEmailAddress()), err)
+		}
+	}
+	manager := w.oauthManagerForMailbox(mailbox, httpClient)
 	accessToken, err := manager.GetAccessToken(ctx)
 	if err != nil {
-		w.store.MarkAuthFailed(ctx, mailbox.GetEmailAddress(), err)
+		w.markMailboxAuthError(ctx, mailbox.GetEmailAddress(), err)
 		return nil, err
 	}
 	if err := w.persistTokens(ctx, mailbox, manager); err != nil {
-		w.store.MarkAuthFailed(ctx, mailbox.GetEmailAddress(), err)
+		w.markMailboxAuthError(ctx, mailbox.GetEmailAddress(), err)
 		return nil, err
 	}
-	messages, err := w.fetchRecentMessages(ctx, accessToken, limit, receivedAfterNs)
+	messages, err := w.fetchRecentMessages(ctx, httpClient, accessToken, limit, receivedAfterNs)
 	if err != nil {
 		var graphErr *GraphFetchError
 		if !errors.As(err, &graphErr) {
-			w.store.MarkAuthFailed(ctx, mailbox.GetEmailAddress(), err)
+			w.markMailboxAuthError(ctx, mailbox.GetEmailAddress(), err)
 			return nil, err
 		}
 		if !graphErr.IsAuth() {
@@ -173,17 +185,27 @@ func (w *MailWatcher) fetchMailboxMessages(ctx context.Context, mailbox *pb.Emai
 			err = w.persistTokens(ctx, mailbox, manager)
 		}
 		if err == nil {
-			messages, err = w.fetchRecentMessages(ctx, accessToken, limit, receivedAfterNs)
+			messages, err = w.fetchRecentMessages(ctx, httpClient, accessToken, limit, receivedAfterNs)
 		}
 		if err != nil {
-			w.store.MarkAuthFailed(ctx, mailbox.GetEmailAddress(), err)
+			w.markMailboxAuthError(ctx, mailbox.GetEmailAddress(), err)
 			return nil, err
 		}
 	}
 	return messages, nil
 }
 
-func (w *MailWatcher) oauthManagerForMailbox(mailbox *pb.EmailMailbox) *OAuthManager {
+func (w *MailWatcher) httpClientForMailbox(ctx context.Context, mailbox *pb.EmailMailbox) (*http.Client, string, error) {
+	if w.outlookProxy == nil || !w.outlookProxy.enabled() {
+		return w.httpClient, "", nil
+	}
+	return w.outlookProxy.clientForMailbox(ctx, mailbox.GetEmailAddress(), mailbox.GetHomeCountry(), w.httpClient)
+}
+
+func (w *MailWatcher) oauthManagerForMailbox(mailbox *pb.EmailMailbox, httpClient *http.Client) *OAuthManager {
+	if w.outlookProxy != nil && w.outlookProxy.enabled() {
+		return NewOAuthManagerWithClient(mailbox.GetRefreshToken(), httpClient)
+	}
 	key := normalizeEmail(mailbox.GetEmailAddress())
 	refreshToken := strings.TrimSpace(mailbox.GetRefreshToken())
 	w.mu.Lock()
@@ -204,10 +226,34 @@ func (w *MailWatcher) persistTokens(ctx context.Context, mailbox *pb.EmailMailbo
 	return nil
 }
 
-func (w *MailWatcher) fetchRecentMessages(ctx context.Context, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
+func (w *MailWatcher) markMailboxAuthError(ctx context.Context, email string, err error) {
+	if outlookNeedsManualRecovery(err) {
+		if _, updateErr := w.store.MarkEmailAuthStatus(ctx, email, authStatusNeedsManualVerify, err.Error()); updateErr != nil {
+			logWarning("failed to mark mailbox manual verification for %s: %v", redactEmail(email), updateErr)
+		}
+		return
+	}
+	w.store.MarkAuthFailed(ctx, email, err)
+}
+
+func outlookNeedsManualRecovery(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "aadsts70000") ||
+		strings.Contains(text, "service abuse") ||
+		strings.Contains(text, "account.live.com/abuse") ||
+		strings.Contains(text, "needs_manual_verification") ||
+		strings.Contains(text, "verify your identity") ||
+		strings.Contains(text, "help us protect") ||
+		strings.Contains(text, "invalid_grant")
+}
+
+func (w *MailWatcher) fetchRecentMessages(ctx context.Context, httpClient *http.Client, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		messages, err := w.fetchOnce(ctx, accessToken, limit, receivedAfterNs)
+		messages, err := w.fetchOnce(ctx, httpClient, accessToken, limit, receivedAfterNs)
 		if err == nil {
 			return messages, nil
 		}
@@ -231,14 +277,14 @@ func (w *MailWatcher) fetchRecentMessages(ctx context.Context, accessToken strin
 	return nil, lastErr
 }
 
-func (w *MailWatcher) fetchOnce(ctx context.Context, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
-	if strings.TrimSpace(w.graphURL) == defaultGraphMessagesURL {
+func (w *MailWatcher) fetchOnce(ctx context.Context, httpClient *http.Client, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
+	if strings.TrimSpace(w.graphURL) == defaultGraphMessagesURL && (w.outlookProxy == nil || !w.outlookProxy.enabled()) {
 		return w.fetchOnceWithGraphSDK(ctx, accessToken, limit, receivedAfterNs)
 	}
-	return w.fetchOnceREST(ctx, accessToken, limit, receivedAfterNs)
+	return w.fetchOnceREST(ctx, httpClient, accessToken, limit, receivedAfterNs)
 }
 
-func (w *MailWatcher) fetchOnceREST(ctx context.Context, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
+func (w *MailWatcher) fetchOnceREST(ctx context.Context, httpClient *http.Client, accessToken string, limit int, receivedAfterNs int64) ([]graphMessage, error) {
 	u, err := url.Parse(w.graphURL)
 	if err != nil {
 		return nil, err
@@ -260,7 +306,10 @@ func (w *MailWatcher) fetchOnceREST(ctx context.Context, accessToken string, lim
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Prefer", `outlook.body-content-type="text"`)
 
-	resp, err := w.httpClient.Do(req)
+	if httpClient == nil {
+		httpClient = w.httpClient
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

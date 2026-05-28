@@ -82,7 +82,8 @@ func cloudflareMailboxProvider() *mailboxProviderDefinition {
 func listCloudflareVirtualMailboxes(ctx context.Context, pool *pgxpool.Pool, limit int) ([]*pb.EmailMailbox, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT 'cloudflare:' || msg.mailbox_email, msg.mailbox_email,
-			$1, '', '', '', '', '', MIN(msg.created_at), MAX(msg.updated_at)
+			$1, '', '', '', '', '', '', '', '', '', '', '', FALSE,
+			MIN(msg.created_at), MAX(msg.updated_at)
 		FROM mailbox_inbox_messages msg
 		WHERE msg.provider = $1
 		  AND NOT EXISTS (SELECT 1 FROM mailboxes m WHERE m.email = msg.mailbox_email)

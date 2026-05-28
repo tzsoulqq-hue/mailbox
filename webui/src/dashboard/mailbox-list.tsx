@@ -1,4 +1,4 @@
-import { AlertCircle, KeyRound, Mail, Trash2 } from 'lucide-react';
+import { AlertCircle, KeyRound, Mail, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   RecordActionButtons,
   RecordActions,
@@ -13,10 +13,10 @@ import {
 } from '@/dashboard/module-kit';
 import { WorkflowActionButton } from '@/dashboard/modules/workflow/sdk';
 import { maskEmail, normalizeUiEmail } from './email-utils';
-import { authStatus, canRunMailboxAction, domainForEmail, mailboxActions, providerAction, uniqueStrings } from './mailbox-utils';
+import { authStatus, canRunMailboxAction, domainForEmail, mailboxActions, mailboxProviderValue, providerAction, uniqueStrings } from './mailbox-utils';
 import type { Job, Mailbox, MailboxProviderCapability } from './types';
 
-export function MailboxRecordList({ mailboxes, emptyText, providerCapability, showStatus, selected, busy, showSecrets, oauthing, runningWorkflowByEmail, onSelect, onOpenWorkflow, onOAuth, onDelete }: {
+export function MailboxRecordList({ mailboxes, emptyText, providerCapability, showStatus, selected, busy, showSecrets, oauthing, manualRecoverying, runningWorkflowByEmail, onSelect, onOpenWorkflow, onOAuth, onManualRecovery, onDelete }: {
   mailboxes: Mailbox[];
   emptyText: string;
   providerCapability?: MailboxProviderCapability;
@@ -25,10 +25,12 @@ export function MailboxRecordList({ mailboxes, emptyText, providerCapability, sh
   busy: boolean;
   showSecrets: boolean;
   oauthing: string;
+  manualRecoverying: string;
   runningWorkflowByEmail: Map<string, Job>;
   onSelect: (mailbox: Mailbox) => void;
   onOpenWorkflow: (job: Job) => void;
   onOAuth: (emailAddress?: string) => Promise<void>;
+  onManualRecovery: (emailAddress: string) => Promise<void>;
   onDelete: (mailbox: Mailbox) => Promise<void>;
 }) {
   return (
@@ -41,12 +43,14 @@ export function MailboxRecordList({ mailboxes, emptyText, providerCapability, sh
           busy={busy}
           showSecrets={showSecrets}
           oauthing={oauthing}
+          manualRecoverying={manualRecoverying}
           showStatus={showStatus ?? true}
           providerCapability={providerCapability}
           currentWorkflow={runningWorkflowByEmail.get(normalizeUiEmail(mailbox.email_address))}
           onSelect={onSelect}
           onOpenWorkflow={onOpenWorkflow}
           onOAuth={onOAuth}
+          onManualRecovery={onManualRecovery}
           onDelete={onDelete}
         />
       ))}
@@ -65,10 +69,12 @@ export function MailboxDomainGroups(props: {
   busy: boolean;
   showSecrets: boolean;
   oauthing: string;
+  manualRecoverying: string;
   runningWorkflowByEmail: Map<string, Job>;
   onSelect: (mailbox: Mailbox) => void;
   onOpenWorkflow: (job: Job) => void;
   onOAuth: (emailAddress?: string) => Promise<void>;
+  onManualRecovery: (emailAddress: string) => Promise<void>;
   onDelete: (mailbox: Mailbox) => Promise<void>;
 }) {
   const configuredDomains = props.configuredDomains.map((domain) => domain.toLowerCase());
@@ -95,24 +101,28 @@ export function MailboxDomainGroups(props: {
   );
 }
 
-function MailboxCard({ mailbox, selected, busy, showSecrets, oauthing, showStatus, providerCapability, currentWorkflow, onSelect, onOpenWorkflow, onOAuth, onDelete }: {
+function MailboxCard({ mailbox, selected, busy, showSecrets, oauthing, manualRecoverying, showStatus, providerCapability, currentWorkflow, onSelect, onOpenWorkflow, onOAuth, onManualRecovery, onDelete }: {
   mailbox: Mailbox;
   selected: boolean;
   busy: boolean;
   showSecrets: boolean;
   oauthing: string;
+  manualRecoverying: string;
   showStatus: boolean;
   providerCapability?: MailboxProviderCapability;
   currentWorkflow?: Job;
   onSelect: (mailbox: Mailbox) => void;
   onOpenWorkflow: (job: Job) => void;
   onOAuth: (emailAddress?: string) => Promise<void>;
+  onManualRecovery: (emailAddress: string) => Promise<void>;
   onDelete: (mailbox: Mailbox) => Promise<void>;
 }) {
   const displayEmail = showSecrets ? mailbox.email_address : maskEmail(mailbox.email_address);
   const isOAuthing = oauthing === mailbox.email_address || oauthing === '*';
+  const isManualRecoverying = manualRecoverying === mailbox.email_address;
   const oauthAction = providerAction(providerCapability, mailboxActions.runOAuth);
   const canOAuth = canRunMailboxAction(mailbox, oauthAction);
+  const canManualRecovery = mailboxProviderValue(mailbox.provider) === 'outlook';
   const oauthLabel = '补 OAuth';
   const rowActions: RowActionDescriptor[] = [{
     id: 'delete-mailbox',
@@ -122,6 +132,16 @@ function MailboxCard({ mailbox, selected, busy, showSecrets, oauthing, showStatu
     kind: 'danger',
     onClick: () => void onDelete(mailbox),
   }];
+
+  if (!currentWorkflow && canManualRecovery) {
+    rowActions.unshift({
+      id: 'manual-recovery',
+      label: isManualRecoverying ? '恢复启动中' : '人工恢复',
+      icon: <ShieldAlert className="size-4" />,
+      disabled: busy || !!manualRecoverying,
+      onClick: () => void onManualRecovery(mailbox.email_address),
+    });
+  }
 
   if (!currentWorkflow && canOAuth) {
     rowActions.unshift({

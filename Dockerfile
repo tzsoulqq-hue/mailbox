@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 FROM docker.m.daocloud.io/library/golang:1.26-alpine AS builder
 
 WORKDIR /app
@@ -22,8 +20,7 @@ RUN mkdir -p /generated/pb \
       proto/mailbox_service.proto
 
 COPY services/mailbox-api ./
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    rm -rf pb \
+RUN rm -rf pb \
     && cp -R /generated/pb ./pb \
     && go build -o /out/mailbox .
 

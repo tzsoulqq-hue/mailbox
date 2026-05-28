@@ -18,16 +18,23 @@ import (
 )
 
 type mailboxRow struct {
-	ID           string
-	Email        string
-	Provider     string
-	Password     string
-	RefreshToken string
-	AccessToken  string
-	AuthStatus   string
-	LastError    string
-	CreatedAt    int64
-	UpdatedAt    int64
+	ID                     string
+	Email                  string
+	Provider               string
+	Password               string
+	RefreshToken           string
+	AccessToken            string
+	AuthStatus             string
+	LastError              string
+	HomeCountry            string
+	HomeIP                 string
+	ProxyProfile           string
+	LastProxyCountry       string
+	LastProxySession       string
+	LastProxyIP            string
+	ManualRecoveryRequired bool
+	CreatedAt              int64
+	UpdatedAt              int64
 }
 
 type inboxMessageRow struct {
@@ -789,7 +796,8 @@ func (s *MailboxStore) MarkEmailAuthStatus(ctx context.Context, email string, au
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	row, err := scanMailbox(tx.QueryRow(ctx, mailboxSelectSQL()+" WHERE m.email = $1 FOR UPDATE", email))
+	var provider string
+	err = tx.QueryRow(ctx, "SELECT provider FROM mailboxes WHERE email = $1 FOR UPDATE", email).Scan(&provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("mailbox not found: %s", redactEmail(email))
 	}
@@ -797,7 +805,7 @@ func (s *MailboxStore) MarkEmailAuthStatus(ctx context.Context, email string, au
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if err := mailboxProviderUpdateAuth(ctx, tx, row.Provider, email, authStatus, lastError, now); err != nil {
+	if err := mailboxProviderUpdateAuth(ctx, tx, provider, email, authStatus, lastError, now); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx, "UPDATE mailboxes SET updated_at = $1 WHERE email = $2", now, email); err != nil {
@@ -920,6 +928,23 @@ func (s *MailboxStore) UpdateMailboxTokens(ctx context.Context, email string, re
 	return err
 }
 
+func (s *MailboxStore) UpdateOutlookProxyUse(ctx context.Context, email string, country string, proxySession string, proxyIP string) error {
+	email = normalizeEmail(email)
+	if email == "" {
+		return errors.New("email_address is required")
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE mailbox_outlook_accounts
+		SET last_proxy_country = CASE WHEN $2 <> '' THEN $2 ELSE last_proxy_country END,
+			last_proxy_session = CASE WHEN $3 <> '' THEN $3 ELSE last_proxy_session END,
+			last_proxy_ip = CASE WHEN $4 <> '' THEN $4 ELSE last_proxy_ip END,
+			updated_at = $5
+		WHERE mailbox_email = $1
+	`, email, strings.ToUpper(strings.TrimSpace(country)), strings.TrimSpace(proxySession),
+		strings.TrimSpace(proxyIP), time.Now().Unix())
+	return err
+}
+
 func (s *MailboxStore) MarkAuthFailed(ctx context.Context, email string, err error) {
 	if _, updateErr := s.MarkEmailAuthStatus(ctx, email, authStatusAuthFailed, err.Error()); updateErr != nil {
 		logWarning("failed to mark mailbox auth failed for %s: %v", redactEmail(email), updateErr)
@@ -937,6 +962,13 @@ func scanMailbox(scanner rowScanner) (*mailboxRow, error) {
 		&row.AccessToken,
 		&row.AuthStatus,
 		&row.LastError,
+		&row.HomeCountry,
+		&row.HomeIP,
+		&row.ProxyProfile,
+		&row.LastProxyCountry,
+		&row.LastProxySession,
+		&row.LastProxyIP,
+		&row.ManualRecoveryRequired,
 		&row.CreatedAt,
 		&row.UpdatedAt,
 	)
@@ -951,16 +983,23 @@ func (m *mailboxRow) toProto() *pb.EmailMailbox {
 		return nil
 	}
 	mailbox := &pb.EmailMailbox{
-		EmailAddress: m.Email,
-		Provider:     normalizeEmailProvider(m.Provider),
-		Password:     m.Password,
-		RefreshToken: m.RefreshToken,
-		AccessToken:  m.AccessToken,
-		AuthStatus:   m.AuthStatus,
-		LastError:    m.LastError,
-		CreatedAt:    m.CreatedAt,
-		UpdatedAt:    m.UpdatedAt,
-		Domain:       domainForEmail(m.Email),
+		EmailAddress:           m.Email,
+		Provider:               normalizeEmailProvider(m.Provider),
+		Password:               m.Password,
+		RefreshToken:           m.RefreshToken,
+		AccessToken:            m.AccessToken,
+		AuthStatus:             m.AuthStatus,
+		LastError:              m.LastError,
+		CreatedAt:              m.CreatedAt,
+		UpdatedAt:              m.UpdatedAt,
+		Domain:                 domainForEmail(m.Email),
+		HomeCountry:            m.HomeCountry,
+		HomeIp:                 m.HomeIP,
+		ProxyProfile:           m.ProxyProfile,
+		LastProxyCountry:       m.LastProxyCountry,
+		LastProxySession:       m.LastProxySession,
+		LastProxyIp:            m.LastProxyIP,
+		ManualRecoveryRequired: m.ManualRecoveryRequired,
 	}
 	prepareMailboxProjection(mailbox)
 	return mailbox
